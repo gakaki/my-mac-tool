@@ -115,6 +115,7 @@ struct SyncUi {
     remote_path: Signal<String>,
     local_path: Signal<String>,
     jobs: Signal<String>,
+    ignore_patterns: Signal<String>,
     delete_missing: Signal<bool>,
     status: Signal<String>,
     detail: Signal<String>,
@@ -283,6 +284,10 @@ impl ProcessUi {
 impl SyncUi {
     fn new() -> Self {
         let current_user = env::var("USER").unwrap_or_else(|_| "g".to_string());
+        let ignore_patterns = sync::load_config()
+            .map(|config| config.ignore_patterns)
+            .unwrap_or_else(|_| sync::default_ignore_patterns())
+            .join("\n");
         Self {
             host: signal("192.168.32.6".to_string()),
             user: signal(current_user),
@@ -290,6 +295,7 @@ impl SyncUi {
             remote_path: signal("/Users/g/Desktop".to_string()),
             local_path: signal("~/Desktop/来自-192.168.32.6".to_string()),
             jobs: signal("4".to_string()),
+            ignore_patterns: signal(ignore_patterns),
             delete_missing: signal(false),
             status: signal("准备连接另一台 Mac。首次使用请先配置 SSH 免密登录。".to_string()),
             detail: signal(
@@ -333,6 +339,7 @@ impl SyncUi {
             local_path: self.local_path.get(),
             jobs,
             delete_missing: self.delete_missing.get(),
+            ignore_patterns: sync::parse_ignore_patterns(&self.ignore_patterns.get()),
         })
     }
 
@@ -423,6 +430,48 @@ impl SyncUi {
         match sync::prepare_ssh_access(&options) {
             Ok(message) => {
                 self.status.set(message);
+                self.success.set(true);
+            }
+            Err(error) => {
+                self.status.set(error);
+                self.success.set(false);
+            }
+        }
+    }
+
+    fn save_ignore_patterns(&self) {
+        if self.running.get() {
+            self.status
+                .set("同步进行中；忽略列表修改将在下次任务生效。".to_string());
+            return;
+        }
+        let patterns = sync::parse_ignore_patterns(&self.ignore_patterns.get());
+        let config = sync::SyncConfig {
+            ignore_patterns: patterns.clone(),
+        };
+        match sync::save_config(&config) {
+            Ok(()) => {
+                self.ignore_patterns.set(patterns.join("\n"));
+                self.status
+                    .set(format!("忽略列表已保存，共 {} 条规则。", patterns.len()));
+                self.success.set(true);
+            }
+            Err(error) => {
+                self.status.set(error);
+                self.success.set(false);
+            }
+        }
+    }
+
+    fn restore_default_ignores(&self) {
+        let patterns = sync::default_ignore_patterns();
+        self.ignore_patterns.set(patterns.join("\n"));
+        let config = sync::SyncConfig {
+            ignore_patterns: patterns,
+        };
+        match sync::save_config(&config) {
+            Ok(()) => {
+                self.status.set("已恢复内置忽略列表。".to_string());
                 self.success.set(true);
             }
             Err(error) => {
@@ -742,6 +791,23 @@ fn field(label: &'static str, value: Signal<String>) -> View {
                 .border_color(move || theme().border)
                 .bg(move || theme().background),
         )
+}
+
+fn text_area(value: Signal<String>, height: f32) -> View {
+    view().w_full().child(
+        input()
+            .multiline(true)
+            .value(move || value.get())
+            .on_change(move |next: &str| value.set(next.to_owned()))
+            .h(px(height))
+            .p_3()
+            .rounded_md()
+            .border_1()
+            .border_color(move || theme().border)
+            .bg(move || theme().background)
+            .font_family("Menlo")
+            .text_size(px(12.0)),
+    )
 }
 
 fn progress_row(task: InstallTask) -> View {
@@ -1792,6 +1858,8 @@ fn sync_page(ui: SyncUi) -> AnyElement {
     let progress_color_ui = ui.clone();
     let progress_text_ui = ui.clone();
     let progress_bar_ui = ui.clone();
+    let ignore_save_ui = ui.clone();
+    let ignore_default_ui = ui.clone();
     let status_color = move || {
         if status_ui.success.get() {
             theme().chart_1
@@ -1915,6 +1983,36 @@ fn sync_page(ui: SyncUi) -> AnyElement {
             )
             .child(
                 card()
+                    .child(section_title(
+                        "忽略列表",
+                        "每行一条，支持 * 和 ?，以 # 开头为注释；目录规则会同时排除其内容。",
+                    ))
+                    .child(text_area(ui.ignore_patterns, 150.0))
+                    .child(
+                        view()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(action_button("保存忽略列表", true, move || {
+                                ignore_save_ui.save_ignore_patterns();
+                            }))
+                            .child(action_button("恢复内置默认", false, move || {
+                                ignore_default_ui.restore_default_ignores();
+                            }))
+                            .child(
+                                text(move || {
+                                    format!(
+                                        "当前 {} 条 · 内置包含 .DS_Store、._*、__MACOSX 等",
+                                        sync::parse_ignore_patterns(&ui.ignore_patterns.get()).len()
+                                    )
+                                })
+                                .text_size(px(11.0))
+                                .text_color(move || theme().muted_foreground),
+                            ),
+                    ),
+            )
+            .child(
+                card()
                     .child(
                         view()
                             .flex_row()
@@ -1996,6 +2094,13 @@ fn sync_page(ui: SyncUi) -> AnyElement {
                     .child(
                         text(
                             "首次 tar 传输前会保存未完成状态；若中途断开，再次开始会用 openrsync 校验并补齐已完成内容，全部成功后才写入完成标记。后续按路径连续切分文件与空目录，减少远端目录反复遍历，并用非目录 XFER 事件修正进度计数。",
+                        )
+                        .text_size(px(12.0))
+                        .text_color(move || theme().muted_foreground),
+                    )
+                    .child(
+                        text(
+                            "增量任务使用动态工作队列：并发数固定，但准备多于并发的连续区块，完成快的线程会立即领取下一块，减少尾部只剩一路的情况。网络中断会按 2、4、8、16、30 秒退避自动重连；权限不足、文件消失和路径过长会作为警告跳过。",
                         )
                         .text_size(px(12.0))
                         .text_color(move || theme().muted_foreground),

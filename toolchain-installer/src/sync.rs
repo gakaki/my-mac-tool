@@ -1,14 +1,32 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+const SYNC_CHUNKS_PER_WORKER: usize = 8;
+
+const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
+    ".DS_Store",
+    "._*",
+    "__MACOSX",
+    "__MAXOSX",
+    ".Spotlight-V100",
+    ".Trashes",
+    ".fseventsd",
+    ".TemporaryItems",
+    "Thumbs.db",
+    "desktop.ini",
+    ".mymac-partial",
+    "*.tmp",
+];
 
 const INVENTORY_SCRIPT: &str = r#"
 root="$1"
@@ -40,6 +58,7 @@ fi
 
 const TAR_ARCHIVE_SCRIPT: &str = r#"
 root="$1"
+shift
 case "$root" in
     "~") root="$HOME" ;;
     "~/"*) root="$HOME/${root#~/}" ;;
@@ -49,7 +68,11 @@ if [ ! -d "$root" ]; then
     exit 4
 fi
 cd "$root" || exit 5
-exec /usr/bin/caffeinate -i /usr/bin/tar -cpf - --acls --xattrs .
+exclude_args=()
+for pattern in "$@"; do
+    exclude_args+=("--exclude=$pattern")
+done
+exec /usr/bin/caffeinate -i /usr/bin/tar -cpf - --acls --xattrs "${exclude_args[@]}" .
 "#;
 
 #[derive(Clone, Debug)]
@@ -61,6 +84,68 @@ pub struct SyncOptions {
     pub local_path: String,
     pub jobs: usize,
     pub delete_missing: bool,
+    pub ignore_patterns: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SyncConfig {
+    #[serde(default = "default_ignore_patterns")]
+    pub ignore_patterns: Vec<String>,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            ignore_patterns: default_ignore_patterns(),
+        }
+    }
+}
+
+pub fn load_config() -> Result<SyncConfig, String> {
+    let path = sync_config_path()?;
+    if !path.exists() {
+        let config = SyncConfig::default();
+        save_config(&config)?;
+        return Ok(config);
+    }
+    let bytes = fs::read(&path).map_err(|error| format!("无法读取同步忽略列表：{error}"))?;
+    serde_json::from_slice(&bytes).map_err(|error| format!("无法解析同步忽略列表：{error}"))
+}
+
+pub fn save_config(config: &SyncConfig) -> Result<(), String> {
+    let path = sync_config_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("无法创建同步配置目录：{error}"))?;
+    }
+    let bytes = serde_json::to_vec_pretty(config)
+        .map_err(|error| format!("无法编码同步忽略列表：{error}"))?;
+    fs::write(path, bytes).map_err(|error| format!("无法保存同步忽略列表：{error}"))
+}
+
+pub fn parse_ignore_patterns(text: &str) -> Vec<String> {
+    let mut patterns = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| line.trim_matches('/').to_string())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    patterns.sort();
+    patterns.dedup();
+    patterns
+}
+
+pub fn default_ignore_patterns() -> Vec<String> {
+    DEFAULT_IGNORE_PATTERNS
+        .iter()
+        .map(|pattern| (*pattern).to_string())
+        .collect()
+}
+
+fn sync_config_path() -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME").ok_or_else(|| "无法确定用户目录。".to_string())?;
+    Ok(PathBuf::from(home)
+        .join("Library/Application Support/我的 Mac 设置和开发工具安装/sync-config.json"))
 }
 
 #[derive(Clone, Debug)]
@@ -105,6 +190,7 @@ struct Inventory {
     entries: Vec<RemoteEntry>,
     file_count: u64,
     total_bytes: u64,
+    ignored_entries: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -123,6 +209,7 @@ enum WorkerMessage {
     Error {
         batch: usize,
         line: String,
+        skippable: bool,
     },
     Finished {
         batch: usize,
@@ -131,6 +218,7 @@ enum WorkerMessage {
         items: u64,
         bytes: u64,
     },
+    WorkerFinished,
 }
 
 pub fn test_connection(options: &SyncOptions, tx: Sender<SyncEvent>) {
@@ -148,17 +236,107 @@ pub fn test_connection(options: &SyncOptions, tx: Sender<SyncEvent>) {
 }
 
 pub fn run_sync(options: SyncOptions, cancel: Arc<AtomicBool>, tx: Sender<SyncEvent>) {
-    let result = run_sync_inner(&options, &cancel, &tx);
-    let _ = tx.send(match result {
-        Ok(message) => SyncEvent::Finished {
-            success: true,
-            message,
-        },
-        Err(message) => SyncEvent::Finished {
-            success: false,
-            message,
-        },
-    });
+    let mut reconnect_attempt = 0_u32;
+    loop {
+        let result = run_sync_inner(&options, &cancel, &tx);
+        match result {
+            Ok(message) => {
+                let _ = tx.send(SyncEvent::Finished {
+                    success: true,
+                    message,
+                });
+                return;
+            }
+            Err(message) if cancel.load(Ordering::Relaxed) => {
+                let _ = tx.send(SyncEvent::Finished {
+                    success: false,
+                    message,
+                });
+                return;
+            }
+            Err(message) if is_retryable_connection_error(&message) => {
+                reconnect_attempt = reconnect_attempt.saturating_add(1);
+                let delay =
+                    Duration::from_secs(2_u64.saturating_pow(reconnect_attempt.min(4)).min(30));
+                let status = format!(
+                    "连接中断：{message}；{delay_seconds} 秒后自动重连并继续（第 {reconnect_attempt} 次）",
+                    delay_seconds = delay.as_secs()
+                );
+                if tx.send(SyncEvent::Status(status)).is_err() {
+                    return;
+                }
+                if !wait_for_retry(&cancel, delay) {
+                    let _ = tx.send(SyncEvent::Finished {
+                        success: false,
+                        message: "同步已停止；已完成的文件会保留。".to_string(),
+                    });
+                    return;
+                }
+            }
+            Err(message) => {
+                let _ = tx.send(SyncEvent::Finished {
+                    success: false,
+                    message,
+                });
+                return;
+            }
+        }
+    }
+}
+
+fn is_retryable_connection_error(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    [
+        "connection timed out",
+        "operation timed out",
+        "connection reset",
+        "connection closed",
+        "connection refused",
+        "broken pipe",
+        "host is down",
+        "network is unreachable",
+        "no route to host",
+        "unexpectedly closed",
+        "ssh_exchange_identification",
+        "remote tar",
+        "远端 tar 流失败",
+        "扫描远端目录失败",
+        "code 255",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn is_skippable_rsync_error(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    [
+        "permission denied",
+        "operation not permitted",
+        "file name too long",
+        "no such file or directory",
+        "file has vanished",
+        "files vanished",
+        "failed to stat",
+        "cannot stat",
+        "readlink",
+        "too many levels of symbolic links",
+        "socket ignored",
+        "some files/attrs were not transferred",
+        "code 23",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn wait_for_retry(cancel: &AtomicBool, delay: Duration) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < delay {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    !cancel.load(Ordering::Relaxed)
 }
 
 pub fn prepare_ssh_access(options: &SyncOptions) -> Result<String, String> {
@@ -356,15 +534,17 @@ fn run_sync_inner(
     let completed_copy = has_completed_copy(options, &local_root);
     let interrupted_copy = has_partial_copy(options, &local_root);
     let (results, engine, lanes) = if completed_copy {
-        let batches = plan_batches_with_mode(&inventory.entries, options.jobs, small_file_mode);
-        let batch_count = batches.len();
+        let batches = plan_work_batches(&inventory.entries, options.jobs, small_file_mode);
+        let chunk_count = batches.len();
+        let lanes = options.jobs.clamp(1, 8).min(chunk_count);
         send_status(
             tx,
             &format!(
-                "索引完成：{} 个文件，{}，拆分为 {} 路增量同步。",
+                "索引完成：{} 个文件，{}，{} 路并行、{} 个动态工作单元。",
                 inventory.file_count,
                 format_bytes(inventory.total_bytes),
-                batch_count
+                lanes,
+                chunk_count
             ),
         );
         let results = run_batches(
@@ -377,14 +557,15 @@ fn run_sync_inner(
             started,
             small_file_mode,
         )?;
-        (results, "openrsync 增量", batch_count)
+        (results, "openrsync 增量", lanes)
     } else if interrupted_copy {
         send_status(
             tx,
             "检测到上次未完成的传输。正在通过 openrsync 校验并补齐已有内容…",
         );
-        let batches = plan_batches_with_mode(&inventory.entries, options.jobs, small_file_mode);
-        let batch_count = batches.len();
+        let batches = plan_work_batches(&inventory.entries, options.jobs, small_file_mode);
+        let chunk_count = batches.len();
+        let lanes = options.jobs.clamp(1, 8).min(chunk_count);
         let results = run_batches(
             options,
             &local_root,
@@ -397,7 +578,7 @@ fn run_sync_inner(
         )?;
         mark_completed_copy(options, &local_root)?;
         clear_partial_copy(options, &local_root)?;
-        (results, "openrsync 断点补齐", batch_count)
+        (results, "openrsync 断点补齐", lanes)
     } else {
         send_status(
             tx,
@@ -420,8 +601,18 @@ fn run_sync_inner(
     }
 
     let elapsed = started.elapsed();
+    let warning_note = if results.warnings > 0 {
+        format!("；跳过 {} 条无权限/失效路径警告", results.warnings)
+    } else {
+        String::new()
+    };
+    let ignored_note = if inventory.ignored_entries > 0 {
+        format!("；忽略列表排除 {} 项", inventory.ignored_entries)
+    } else {
+        String::new()
+    };
     Ok(format!(
-        "同步完成：{} 个文件，{}；耗时 {}；{}，{} 路；平均 {}/s。",
+        "同步完成：{} 个文件，{}；耗时 {}；{}，{} 路；平均 {}/s{warning_note}{ignored_note}。",
         results.files,
         format_bytes(results.bytes),
         format_duration(elapsed),
@@ -440,8 +631,15 @@ fn run_stream_archive(
     tx: &Sender<SyncEvent>,
     started: Instant,
 ) -> Result<BatchResults, String> {
+    let mut tar_arguments = Vec::with_capacity(options.ignore_patterns.len() + 1);
+    tar_arguments.push(options.remote_path.clone());
+    tar_arguments.extend(options.ignore_patterns.iter().cloned());
+    let tar_argument_refs = tar_arguments.iter().map(String::as_str).collect::<Vec<_>>();
     let mut archive = ssh_command(options)
-        .arg(remote_command(TAR_ARCHIVE_SCRIPT, &options.remote_path))
+        .arg(remote_command_with_args(
+            TAR_ARCHIVE_SCRIPT,
+            &tar_argument_refs,
+        ))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -576,6 +774,7 @@ fn run_stream_archive(
         files: inventory.file_count,
         bytes: inventory.total_bytes,
         rate: (inventory.total_bytes as f64 / elapsed) as u64,
+        warnings: 0,
     })
 }
 
@@ -583,6 +782,7 @@ struct BatchResults {
     files: u64,
     bytes: u64,
     rate: u64,
+    warnings: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -596,44 +796,74 @@ fn run_batches(
     started: Instant,
     small_file_mode: bool,
 ) -> Result<BatchResults, String> {
-    let batch_count = batches.len();
-    if batch_count == 0 {
+    let total_batches = batches.len();
+    if total_batches == 0 {
         send_completed_progress(tx, inventory, started, small_file_mode);
         return Ok(BatchResults {
             files: 0,
             bytes: 0,
             rate: 0,
+            warnings: 0,
         });
     }
+    let worker_count = options.jobs.clamp(1, 8).min(total_batches);
+    let abort = Arc::new(AtomicBool::new(false));
+    let (task_tx, task_rx) = mpsc::channel::<(usize, Batch)>();
+    for (batch_index, batch) in batches.into_iter().enumerate() {
+        let _ = task_tx.send((batch_index, batch));
+    }
+    drop(task_tx);
+    let task_rx = Arc::new(Mutex::new(task_rx));
     let (worker_tx, worker_rx): (Sender<WorkerMessage>, Receiver<WorkerMessage>) = mpsc::channel();
-    let mut handles = Vec::with_capacity(batch_count);
-    for (batch_index, batch) in batches.iter().cloned().enumerate() {
+    let mut handles = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
         let sender = worker_tx.clone();
         let options = options.clone();
         let local_root = local_root.to_path_buf();
         let cancel = cancel.clone();
+        let abort = abort.clone();
         let source_root = inventory.root.clone();
+        let task_rx = task_rx.clone();
         handles.push(thread::spawn(move || {
-            run_batch(
-                batch_index,
-                batch,
-                &options,
-                &source_root,
-                &local_root,
-                cancel,
-                sender,
-            );
+            loop {
+                if cancel.load(Ordering::Relaxed) || abort.load(Ordering::Relaxed) {
+                    break;
+                }
+                let next = task_rx
+                    .lock()
+                    .expect("sync task queue poisoned")
+                    .recv()
+                    .ok();
+                let Some((batch_index, batch)) = next else {
+                    break;
+                };
+                run_batch(
+                    batch_index,
+                    batch,
+                    &options,
+                    &source_root,
+                    &local_root,
+                    cancel.clone(),
+                    abort.clone(),
+                    sender.clone(),
+                );
+            }
+            let _ = sender.send(WorkerMessage::WorkerFinished);
         }));
     }
+    drop(task_rx);
     drop(worker_tx);
 
-    let mut active = batch_count;
-    let mut completed_items = vec![0_u64; batch_count];
-    let mut completed_bytes = vec![0_u64; batch_count];
-    let mut batch_errors = vec![Vec::<String>::new(); batch_count];
+    let mut active = worker_count;
+    let mut completed_items = vec![0_u64; total_batches];
+    let mut completed_bytes = vec![0_u64; total_batches];
+    let mut batch_errors = vec![Vec::<String>::new(); total_batches];
     let mut worker_failures = Vec::new();
     let mut last_emit = Instant::now() - Duration::from_secs(1);
     let mut cancelled = false;
+    let mut warnings = 0_u64;
+    let mut fatal_error = None;
+    let mut last_warning_status = Instant::now() - Duration::from_secs(2);
 
     while active > 0 {
         match worker_rx.recv_timeout(Duration::from_millis(150)) {
@@ -654,7 +884,7 @@ fn run_batches(
                         inventory,
                         &completed_items,
                         &completed_bytes,
-                        batch_count,
+                        worker_count,
                         active,
                         started,
                         small_file_mode,
@@ -663,8 +893,29 @@ fn run_batches(
                     last_emit = Instant::now();
                 }
             }
-            Ok(WorkerMessage::Error { batch, line }) => {
-                batch_errors[batch].push(line);
+            Ok(WorkerMessage::Error {
+                batch,
+                line,
+                skippable,
+            }) => {
+                if skippable {
+                    warnings = warnings.saturating_add(1);
+                    if last_warning_status.elapsed() >= Duration::from_secs(2) {
+                        send_status(
+                            tx,
+                            &format!(
+                                "已跳过 {warnings} 条无法访问或路径过长项目，其余批次继续运行…"
+                            ),
+                        );
+                        last_warning_status = Instant::now();
+                    }
+                } else {
+                    if fatal_error.is_none() {
+                        fatal_error = Some(format!("批次 {}：{line}", batch + 1));
+                        abort.store(true, Ordering::Relaxed);
+                    }
+                    batch_errors[batch].push(line);
+                }
             }
             Ok(WorkerMessage::Finished {
                 batch,
@@ -673,24 +924,25 @@ fn run_batches(
                 items,
                 bytes,
             }) => {
-                active = active.saturating_sub(1);
                 cancelled |= was_cancelled;
                 if success {
                     completed_items[batch] = items;
                     completed_bytes[batch] = bytes;
-                    batch_errors[batch].clear();
                 }
                 send_progress(
                     tx,
                     inventory,
                     &completed_items,
                     &completed_bytes,
-                    batch_count,
+                    worker_count,
                     active,
                     started,
                     small_file_mode,
                     false,
                 );
+            }
+            Ok(WorkerMessage::WorkerFinished) => {
+                active = active.saturating_sub(1);
             }
             Err(RecvTimeoutError::Timeout) => {
                 if last_emit.elapsed() >= Duration::from_millis(250) {
@@ -699,7 +951,7 @@ fn run_batches(
                         inventory,
                         &completed_items,
                         &completed_bytes,
-                        batch_count,
+                        worker_count,
                         active,
                         started,
                         small_file_mode,
@@ -721,6 +973,11 @@ fn run_batches(
         }
     }
 
+    if let Some(error) = fatal_error {
+        return Err(format!(
+            "同步因严重错误停止；已完成内容会保留，下次可继续：\n{error}"
+        ));
+    }
     if cancelled {
         return Err("同步已停止；已完成的文件会保留。".to_string());
     }
@@ -757,9 +1014,11 @@ fn run_batches(
         files: completed_items.iter().sum(),
         bytes,
         rate: (bytes as f64 / elapsed) as u64,
+        warnings,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_batch(
     batch_index: usize,
     batch: Batch,
@@ -767,6 +1026,7 @@ fn run_batch(
     source_root: &str,
     local_root: &Path,
     cancel: Arc<AtomicBool>,
+    abort: Arc<AtomicBool>,
     sender: Sender<WorkerMessage>,
 ) {
     let expected_directories = batch
@@ -782,6 +1042,7 @@ fn run_batch(
             let _ = sender.send(WorkerMessage::Error {
                 batch: batch_index,
                 line: format!("无法启动 rsync：{error}"),
+                skippable: false,
             });
             let _ = sender.send(WorkerMessage::Finished {
                 batch: batch_index,
@@ -825,14 +1086,21 @@ fn run_batch(
     let stderr_reader = child.stderr.take().map(|stderr| {
         let sender = sender.clone();
         thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let lines = BufReader::new(stderr)
+                .lines()
+                .map_while(Result::ok)
+                .filter(|line| !line.trim().is_empty())
+                .collect::<Vec<_>>();
+            for line in &lines {
                 if !line.trim().is_empty() {
                     let _ = sender.send(WorkerMessage::Error {
                         batch: batch_index,
-                        line,
+                        line: line.clone(),
+                        skippable: is_skippable_rsync_error(line),
                     });
                 }
             }
+            lines
         })
     });
 
@@ -840,7 +1108,7 @@ fn run_batch(
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
-            Ok(None) if cancel.load(Ordering::Relaxed) => {
+            Ok(None) if cancel.load(Ordering::Relaxed) || abort.load(Ordering::Relaxed) => {
                 was_cancelled = true;
                 let _ = child.kill();
             }
@@ -849,6 +1117,7 @@ fn run_batch(
                 let _ = sender.send(WorkerMessage::Error {
                     batch: batch_index,
                     line: format!("等待 rsync 失败：{error}"),
+                    skippable: false,
                 });
                 break None;
             }
@@ -857,13 +1126,20 @@ fn run_batch(
     if let Some(reader) = stdout_reader {
         let _ = reader.join();
     }
-    if let Some(reader) = stderr_reader {
-        let _ = reader.join();
-    }
+    let stderr_lines = stderr_reader
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
     if let Some(reader) = stdin_writer {
         let _ = reader.join();
     }
-    let success = status.map(|status| status.success()).unwrap_or(false);
+    let status_code = status.and_then(|status| status.code());
+    let status_success = status.is_some_and(|status| status.success());
+    let only_skippable_errors = !stderr_lines.is_empty()
+        && stderr_lines
+            .iter()
+            .all(|line| is_skippable_rsync_error(line));
+    let success = status_success
+        || status_code.is_some_and(|code| (code == 23 || code == 24) && only_skippable_errors);
     let _ = sender.send(WorkerMessage::Finished {
         batch: batch_index,
         success,
@@ -903,6 +1179,12 @@ fn run_delete_pass(
     let output = Command::new("/usr/bin/rsync")
         .arg("-aE")
         .arg("--delete")
+        .args(
+            options
+                .ignore_patterns
+                .iter()
+                .flat_map(|pattern| ["--exclude".to_string(), pattern.clone()]),
+        )
         .arg("-e")
         .arg(ssh_transport(options))
         .arg(remote_source(options, source_root))
@@ -956,6 +1238,7 @@ fn scan_remote(
     let mut entries = Vec::new();
     let mut file_count = 0_u64;
     let mut total_bytes = 0_u64;
+    let mut ignored_entries = 0_u64;
     let mut done = false;
     let mut cancelled = false;
     let mut last_status = Instant::now();
@@ -985,6 +1268,10 @@ fn scan_remote(
                     continue;
                 };
                 entry.relative_path = relative_path;
+                if should_ignore_path(&entry.relative_path, &options.ignore_patterns) {
+                    ignored_entries = ignored_entries.saturating_add(1);
+                    continue;
+                }
                 if entry.kind == EntryKind::File {
                     file_count += 1;
                     total_bytes = total_bytes.saturating_add(entry.size);
@@ -993,7 +1280,9 @@ fn scan_remote(
                 if last_status.elapsed() >= Duration::from_millis(600) {
                     send_status(
                         tx,
-                        &format!("正在索引远端文件：已发现 {file_count} 个文件…"),
+                        &format!(
+                            "正在索引远端文件：已发现 {file_count} 个文件 · 已忽略 {ignored_entries} 项…"
+                        ),
                     );
                     last_status = Instant::now();
                 }
@@ -1031,6 +1320,7 @@ fn scan_remote(
         entries,
         file_count,
         total_bytes,
+        ignored_entries,
     })
 }
 
@@ -1064,20 +1354,87 @@ fn relative_to_root(path: &str, root: &str) -> Option<String> {
     }
 }
 
+fn should_ignore_path(path: &str, patterns: &[String]) -> bool {
+    let normalized = path.trim_start_matches("./").trim_end_matches('/');
+    let components = normalized.split('/').collect::<Vec<_>>();
+    patterns.iter().any(|pattern| {
+        let pattern = pattern.trim_matches('/');
+        if pattern.is_empty() {
+            return false;
+        }
+        if pattern.contains('/') {
+            let pattern_components = pattern.split('/').collect::<Vec<_>>();
+            components.len() >= pattern_components.len()
+                && components.windows(pattern_components.len()).any(|window| {
+                    window
+                        .iter()
+                        .zip(pattern_components.iter())
+                        .all(|(component, pattern)| wildcard_match(pattern, component))
+                })
+        } else {
+            components
+                .iter()
+                .any(|component| wildcard_match(pattern, component))
+        }
+    })
+}
+
+fn wildcard_match(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.to_lowercase().bytes().collect::<Vec<_>>();
+    let value = value.to_lowercase().bytes().collect::<Vec<_>>();
+    let mut previous = vec![false; value.len() + 1];
+    previous[0] = true;
+    for token in pattern {
+        let mut current = vec![false; value.len() + 1];
+        if token == b'*' {
+            current[0] = previous[0];
+            let mut matched_prefix = current[0];
+            for index in 1..=value.len() {
+                matched_prefix |= previous[index];
+                current[index] = matched_prefix;
+            }
+        } else {
+            for index in 1..=value.len() {
+                current[index] =
+                    previous[index - 1] && (token == b'?' || token == value[index - 1]);
+            }
+        }
+        previous = current;
+    }
+    previous[value.len()]
+}
+
 #[cfg(test)]
 fn plan_batches(entries: &[RemoteEntry], jobs: usize) -> Vec<Batch> {
     plan_batches_with_mode(entries, jobs, false)
 }
 
+#[cfg(test)]
 fn plan_batches_with_mode(
     entries: &[RemoteEntry],
     jobs: usize,
     small_file_mode: bool,
 ) -> Vec<Batch> {
+    plan_batches_with_count(entries, jobs, small_file_mode)
+}
+
+fn plan_work_batches(entries: &[RemoteEntry], jobs: usize, small_file_mode: bool) -> Vec<Batch> {
+    let count = jobs
+        .clamp(1, 8)
+        .saturating_mul(SYNC_CHUNKS_PER_WORKER)
+        .min(entries.len().max(1));
+    plan_batches_with_count(entries, count, small_file_mode)
+}
+
+fn plan_batches_with_count(
+    entries: &[RemoteEntry],
+    requested_batches: usize,
+    small_file_mode: bool,
+) -> Vec<Batch> {
     if entries.is_empty() {
         return Vec::new();
     }
-    let count = jobs.clamp(1, 8).min(entries.len().max(1));
+    let count = requested_batches.clamp(1, entries.len());
     if small_file_mode {
         let mut entries = entries.to_vec();
         entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
@@ -1350,11 +1707,16 @@ fn remote_source(options: &SyncOptions, root: &str) -> String {
 }
 
 fn remote_command(script: &str, argument: &str) -> String {
-    format!(
-        "/bin/bash -lc {} -- {}",
-        shell_quote(script),
-        shell_quote(argument)
-    )
+    remote_command_with_args(script, &[argument])
+}
+
+fn remote_command_with_args(script: &str, arguments: &[&str]) -> String {
+    let arguments = arguments
+        .iter()
+        .map(|argument| shell_quote(argument))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("/bin/bash -lc {} -- {arguments}", shell_quote(script),)
 }
 
 fn shell_quote(value: &str) -> String {
@@ -1489,6 +1851,57 @@ mod tests {
                 .iter()
                 .all(|batch| (250..=250).contains(&batch.file_count))
         );
+    }
+
+    #[test]
+    fn work_queue_has_multiple_chunks_per_lane_for_tail_balancing() {
+        let entries = (0..1000)
+            .map(|index| RemoteEntry {
+                relative_path: format!("small/{index:04}.txt"),
+                kind: EntryKind::File,
+                size: 100,
+            })
+            .collect::<Vec<_>>();
+        let batches = plan_work_batches(&entries, 4, true);
+        assert_eq!(batches.len(), 32);
+        assert_eq!(
+            batches.iter().map(|batch| batch.file_count).sum::<u64>(),
+            1000
+        );
+    }
+
+    #[test]
+    fn ignore_patterns_match_builtins_and_custom_paths() {
+        let patterns = parse_ignore_patterns(
+            ".DS_Store\n._*\n__MACOSX\nnode_modules/.cache\n*.tmp\n# comment\n",
+        );
+        assert!(should_ignore_path(".DS_Store", &patterns));
+        assert!(should_ignore_path("photos/._cover.jpg", &patterns));
+        assert!(should_ignore_path("archive/__MACOSX/._file", &patterns));
+        assert!(should_ignore_path(
+            "project/node_modules/.cache/data",
+            &patterns
+        ));
+        assert!(should_ignore_path("project/cache.tmp", &patterns));
+        assert!(!should_ignore_path("project/source.rs", &patterns));
+    }
+
+    #[test]
+    fn connection_and_partial_transfer_errors_are_classified() {
+        assert!(is_retryable_connection_error(
+            "ssh: connect to host example port 22: Operation timed out"
+        ));
+        assert!(is_retryable_connection_error(
+            "rsync error: unexplained error (code 255)"
+        ));
+        assert!(!is_retryable_connection_error("No space left on device"));
+        assert!(is_skippable_rsync_error(
+            "rsync: open failed: Permission denied (13)"
+        ));
+        assert!(is_skippable_rsync_error(
+            "rsync: open failed: File name too long (63)"
+        ));
+        assert!(!is_skippable_rsync_error("No space left on device"));
     }
 
     #[test]

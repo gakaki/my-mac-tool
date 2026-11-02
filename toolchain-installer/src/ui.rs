@@ -635,9 +635,9 @@ fn make_actions(state: UiState) -> Actions {
         start_state
             .display_status
             .set("正在准备显示器原生覆盖…".to_string());
+        start_developer_installers(start_state);
         spawn(async move {
             install_display_for_state(start_state).await;
-            start_developer_installers(start_state);
         });
     });
 
@@ -1163,7 +1163,7 @@ fn all_page(state: UiState, actions: &Actions) -> AnyElement {
         .iter()
         .filter(|task| task.state == TaskState::Success)
         .count();
-    let overall = completed as f32 / tasks.len().max(1) as f32 * 100.0;
+    let overall = tasks.iter().map(|task| task.progress).sum::<f32>() / tasks.len().max(1) as f32;
     let start = actions.start_all.clone();
     page_shell(
         view()
@@ -1903,9 +1903,17 @@ fn auto_clean_page(_state: UiState, ui: ProcessUi) -> AnyElement {
                     .child(
                         view()
                             .w_full()
-                            .gap_1()
-                            .max_h(px(300.0))
-                            .children(process_rows),
+                            .h(px(320.0))
+                            .overflow_hidden()
+                            .rounded_md()
+                            .child(
+                                scroll()
+                                    .w_full()
+                                    .h_full()
+                                    .scrollbar(true)
+                                    .bounces(false)
+                                    .child(view().w_full().p_1().gap_1().children(process_rows)),
+                            ),
                     ),
             )
             .child(

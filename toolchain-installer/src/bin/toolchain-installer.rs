@@ -215,17 +215,21 @@ fn configure_only() -> Result<()> {
 }
 
 fn setup_environment() -> Result<()> {
-    println!("==> Configuring PATH, mirrors, and proxy {PROXY_URL}");
+    report_stage(format!("Preparing local directories and PATH"));
     let layout = Layout::detect()?;
     layout.prepare()?;
     configure_shell(&layout)?;
+    report_stage("Writing npm mirror configuration");
     write_npm_config(&layout.home, &layout.local)?;
     let cargo_home = layout.tools.join("rustup/cargo");
     fs::create_dir_all(&cargo_home).map_err(io_error)?;
+    report_stage("Writing Cargo rsproxy mirror configuration");
     write_cargo_mirror(&cargo_home)?;
+    report_stage("Configuring Git proxy");
     configure_git_proxy()?;
+    report_stage(format!("Configuring system proxy {PROXY_URL}"));
     configure_system_proxy()?;
-    println!("Environment setup complete.");
+    report_stage("Environment setup complete");
     Ok(())
 }
 
@@ -580,7 +584,15 @@ fn configure_git_proxy() -> Result<()> {
 fn configure_system_proxy() -> Result<()> {
     let service = default_network_service()
         .ok_or_else(|| "cannot determine the active network service".to_string())?;
-    println!("Configuring macOS proxy for network service: {service}");
+    report_stage(format!(
+        "Checking macOS proxy for network service: {service}"
+    ));
+    if system_proxy_is_configured(&service) {
+        report_stage(format!(
+            "System proxy already points to {PROXY_HOST}:{PROXY_PORT}; skipping authorization"
+        ));
+        return Ok(());
+    }
     let quoted_service = shell_quote(&service);
     let commands = [
         format!("networksetup -setwebproxy {quoted_service} {PROXY_HOST} {PROXY_PORT}"),
@@ -606,7 +618,7 @@ fn configure_system_proxy() -> Result<()> {
         return Ok(());
     }
 
-    println!("Administrator authorization is required for system proxy settings.");
+    report_stage("Administrator authorization is required for system proxy settings");
     let script = format!(
         "do shell script \"{}\" with administrator privileges",
         commands
@@ -615,6 +627,45 @@ fn configure_system_proxy() -> Result<()> {
             .replace('"', "\\\"")
     );
     run(Command::new("osascript").args(["-e", &script]))
+}
+
+fn system_proxy_is_configured(service: &str) -> bool {
+    ["webproxy", "securewebproxy", "socksfirewallproxy"]
+        .into_iter()
+        .all(|kind| {
+            let output = Command::new("networksetup")
+                .arg(format!("-get{kind}"))
+                .arg(service)
+                .output();
+            let Ok(output) = output else {
+                return false;
+            };
+            if !output.status.success() {
+                return false;
+            }
+            let text = String::from_utf8_lossy(&output.stdout);
+            let enabled = text
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("Enabled:"))
+                .map(str::trim)
+                .is_some_and(|value| value.eq_ignore_ascii_case("yes"));
+            let server = text
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("Server:"))
+                .map(str::trim)
+                .is_some_and(|value| value == PROXY_HOST);
+            let port = text
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("Port:"))
+                .map(str::trim)
+                .is_some_and(|value| value == PROXY_PORT);
+            enabled && server && port
+        })
+}
+
+fn report_stage(message: impl std::fmt::Display) {
+    println!("==> {message}");
+    let _ = io::stdout().flush();
 }
 
 fn default_network_service() -> Option<String> {

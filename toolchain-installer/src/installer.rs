@@ -54,56 +54,161 @@ pub enum Event {
 }
 
 pub fn orchestrate(tx: Sender<Event>, helper: PathBuf) {
-    let setup_ok = run_task(&tx, &helper, SETUP, "setup", "配置代理、PATH 和镜像");
-    if setup_ok {
+    let specs = [
+        (RUST, "install rust", "通过 rsproxy 安装 Rust"),
+        (GO, "install go", "安装 Go 并编译 goproxycn"),
+        (NODE, "install node", "通过 npmmirror 安装 Node.js"),
+        (
+            WRANGLER,
+            "install wrangler-only",
+            "通过 npm 淘宝镜像安装 Wrangler",
+        ),
+        (CLOUDFLARED, "install cloudflared", "下载 Cloudflare Tunnel"),
+        (FLUTTER, "install flutter", "安装 Flutter 与 Dart"),
+    ];
+
+    for (task, _, _) in specs {
+        let _ = tx.send(Event::Progress {
+            task,
+            progress: 1.0,
+            detail: "正在并行检测本地安装…".to_string(),
+        });
+        send_state(&tx, task, TaskState::Running, "正在并行检测本地安装…");
+    }
+
+    let check_workers = specs
+        .iter()
+        .map(|(task, _, _)| {
+            let tx = tx.clone();
+            let helper = helper.clone();
+            let task = *task;
+            thread::spawn(move || {
+                let installed = component_installed(&helper, task);
+                if installed {
+                    let _ = tx.send(Event::Progress {
+                        task,
+                        progress: 100.0,
+                        detail: "检测完成：已安装，跳过下载".to_string(),
+                    });
+                    send_state(&tx, task, TaskState::Success, "检测完成：已安装，跳过下载");
+                } else {
+                    let _ = tx.send(Event::Progress {
+                        task,
+                        progress: 3.0,
+                        detail: "检测完成：未安装，等待并行安装".to_string(),
+                    });
+                }
+                installed
+            })
+        })
+        .collect::<Vec<_>>();
+    let installed = check_workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap_or(false))
+        .collect::<Vec<_>>();
+    let node_index = specs
+        .iter()
+        .position(|(task, _, _)| *task == NODE)
+        .unwrap_or(2);
+    let wrangler_index = specs
+        .iter()
+        .position(|(task, _, _)| *task == WRANGLER)
+        .unwrap_or(3);
+    for (index, (task, _, _)) in specs.iter().enumerate() {
+        if installed[index] {
+            continue;
+        }
+        let detail = if *task == WRANGLER && !installed[node_index] {
+            "未安装：等待 Node.js 完成后安装"
+        } else {
+            "未安装：即将开始并行安装"
+        };
+        let _ = tx.send(Event::Progress {
+            task: *task,
+            progress: 3.0,
+            detail: detail.to_string(),
+        });
+        send_state(&tx, *task, TaskState::Running, detail);
+    }
+
+    let setup_tx = tx.clone();
+    let setup_helper = helper.clone();
+    let setup_worker = thread::spawn(move || {
+        run_task(
+            &setup_tx,
+            &setup_helper,
+            SETUP,
+            "setup",
+            "配置代理、PATH 和镜像",
+        )
+    });
+
+    let mut workers = Vec::new();
+    let mut node_worker = None;
+    for (index, (task, command, detail)) in specs.into_iter().enumerate() {
+        if installed[index] {
+            continue;
+        }
+        let tx = tx.clone();
+        let helper = helper.clone();
+        let worker = thread::spawn(move || install_task(&tx, &helper, task, command, detail));
+        if task == NODE {
+            node_worker = Some(worker);
+        } else if task != WRANGLER {
+            workers.push((task, worker));
+        }
+    }
+
+    let node_ok = node_worker
+        .map(|worker| worker.join().unwrap_or(false))
+        .unwrap_or(true);
+    if !installed[wrangler_index] {
+        if node_ok {
+            let _ = install_task(
+                &tx,
+                &helper,
+                WRANGLER,
+                "install wrangler-only",
+                "通过 npm 淘宝镜像安装 Wrangler",
+            );
+        } else {
+            send_state(
+                &tx,
+                WRANGLER,
+                TaskState::Failed,
+                "Node 安装失败，无法安装 Wrangler",
+            );
+        }
+    }
+
+    for (_, worker) in workers {
+        let _ = worker.join();
+    }
+    if setup_worker.join().unwrap_or(false) {
         send_state(&tx, SETUP, TaskState::Success, "代理、PATH 和镜像已配置");
     } else {
         send_state(
             &tx,
             SETUP,
             TaskState::Warning,
-            "系统代理配置失败；继续使用终端代理安装",
+            "系统代理配置失败；安装仍使用终端代理",
         );
-    }
-
-    let mut workers = Vec::new();
-    for (task, command, detail) in [
-        (RUST, "install rust", "通过 rsproxy 安装 Rust"),
-        (GO, "install go", "安装 Go 并编译 goproxycn"),
-        (NODE, "install node", "通过 npmmirror 安装 Node.js"),
-        (CLOUDFLARED, "install cloudflared", "下载 Cloudflare Tunnel"),
-        (FLUTTER, "install flutter", "安装 Flutter 与 Dart"),
-    ] {
-        let tx = tx.clone();
-        let helper = helper.clone();
-        workers.push(thread::spawn(move || {
-            install_task(&tx, &helper, task, command, detail)
-        }));
-    }
-
-    let node_handle = workers.remove(2);
-    let node_ok = node_handle.join().unwrap_or(false);
-    if node_ok {
-        install_task(
-            &tx,
-            &helper,
-            WRANGLER,
-            "install wrangler-only",
-            "通过 npm 淘宝镜像安装 Wrangler",
-        );
-    } else {
-        send_state(
-            &tx,
-            WRANGLER,
-            TaskState::Failed,
-            "Node 安装失败，无法安装 Wrangler",
-        );
-    }
-
-    for worker in workers {
-        let _ = worker.join();
     }
     let _ = tx.send(Event::AllDone);
+}
+
+fn component_installed(helper: &PathBuf, task: usize) -> bool {
+    let Some(component) = component_name(task) else {
+        return false;
+    };
+    Command::new(helper)
+        .args(["check", component])
+        .env("PATH", gui_path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn install_task(
@@ -113,14 +218,8 @@ fn install_task(
     arguments: &str,
     detail: &str,
 ) -> bool {
-    let component = match task {
-        RUST => "rust",
-        GO => "go",
-        NODE => "node",
-        WRANGLER => "wrangler",
-        CLOUDFLARED => "cloudflared",
-        FLUTTER => "flutter",
-        _ => return false,
+    let Some(component) = component_name(task) else {
+        return false;
     };
     send_state(tx, task, TaskState::Running, "正在快速检测本地安装…");
     let check = Command::new(helper)
@@ -143,6 +242,19 @@ fn install_task(
     run_task(tx, helper, task, arguments, detail)
 }
 
+fn component_name(task: usize) -> Option<&'static str> {
+    match task {
+        RUST => "rust",
+        GO => "go",
+        NODE => "node",
+        WRANGLER => "wrangler",
+        CLOUDFLARED => "cloudflared",
+        FLUTTER => "flutter",
+        _ => return None,
+    }
+    .into()
+}
+
 fn run_task(
     tx: &Sender<Event>,
     helper: &PathBuf,
@@ -150,6 +262,11 @@ fn run_task(
     arguments: &str,
     detail: &str,
 ) -> bool {
+    let _ = tx.send(Event::Progress {
+        task,
+        progress: 2.0,
+        detail: format!("{detail}：正在启动"),
+    });
     send_state(tx, task, TaskState::Running, detail);
     let mut command = Command::new(helper);
     command.args(arguments.split_whitespace());
@@ -269,8 +386,12 @@ fn progress_for_line(task: usize, line: &str) -> Option<f32> {
         return Some(100.0);
     }
     match task {
-        SETUP if lower.contains("configuring") => Some(20.0),
-        SETUP if lower.contains("administrator") => Some(60.0),
+        SETUP if lower.contains("preparing local") => Some(6.0),
+        SETUP if lower.contains("writing npm") => Some(18.0),
+        SETUP if lower.contains("writing cargo") => Some(30.0),
+        SETUP if lower.contains("configuring git") => Some(42.0),
+        SETUP if lower.contains("checking macos proxy") => Some(55.0),
+        SETUP if lower.contains("administrator") => Some(72.0),
         WRANGLER if lower.contains("added") => Some(95.0),
         _ => None,
     }
@@ -325,4 +446,29 @@ pub(crate) fn gui_path() -> String {
     format!(
         "{home}/.local/bin:{home}/.local/share/toolchains/rustup/cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setup_stages_advance_the_visible_progress() {
+        assert_eq!(
+            progress_for_line(SETUP, "==> Preparing local directories and PATH"),
+            Some(6.0)
+        );
+        assert_eq!(
+            progress_for_line(SETUP, "==> Configuring Git proxy"),
+            Some(42.0)
+        );
+        assert_eq!(
+            progress_for_line(SETUP, "==> Checking macOS proxy for network service: Wi-Fi"),
+            Some(55.0)
+        );
+        assert_eq!(
+            progress_for_line(SETUP, "==> Environment setup complete"),
+            Some(100.0)
+        );
+    }
 }

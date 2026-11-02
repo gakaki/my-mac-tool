@@ -214,18 +214,57 @@ fn has_completed_copy(options: &SyncOptions, local_root: &Path) -> bool {
         .ok()
         .and_then(|mut entries| entries.next())
         .is_some();
-    has_files && completion_marker(options, local_root).is_some_and(|path| path.exists())
+    has_files && state_marker(options, local_root, "complete").is_some_and(|path| path.exists())
 }
 
 fn mark_completed_copy(options: &SyncOptions, local_root: &Path) -> Result<(), String> {
-    let Some(marker) = completion_marker(options, local_root) else {
+    let Some(marker) = state_marker(options, local_root, "complete") else {
         return Ok(());
     };
-    if let Some(parent) = marker.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("无法创建同步状态目录：{error}"))?;
+    write_state_marker(&marker, options, local_root)
+}
+
+fn mark_partial_copy(options: &SyncOptions, local_root: &Path) -> Result<(), String> {
+    let Some(marker) = state_marker(options, local_root, "partial") else {
+        return Ok(());
+    };
+    write_state_marker(&marker, options, local_root)
+}
+
+fn has_partial_copy(options: &SyncOptions, local_root: &Path) -> bool {
+    state_marker(options, local_root, "partial").is_some_and(|path| path.exists())
+}
+
+fn clear_partial_copy(options: &SyncOptions, local_root: &Path) -> Result<(), String> {
+    let Some(marker) = state_marker(options, local_root, "partial") else {
+        return Ok(());
+    };
+    match fs::remove_file(&marker) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("无法清理未完成同步状态：{error}")),
     }
+}
+
+fn write_state_marker(
+    marker: &Path,
+    options: &SyncOptions,
+    local_root: &Path,
+) -> Result<(), String> {
+    let Some(parent) = marker.parent() else {
+        return Err("同步状态文件缺少父目录。".to_string());
+    };
+    fs::create_dir_all(parent).map_err(|error| format!("无法创建同步状态目录：{error}"))?;
+    let temporary = marker.with_file_name(format!(
+        ".{}.{}.tmp",
+        marker
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("sync-state"),
+        std::process::id()
+    ));
     fs::write(
-        &marker,
+        &temporary,
         format!(
             "{}@{}:{}|{}|{}",
             options.user,
@@ -235,10 +274,14 @@ fn mark_completed_copy(options: &SyncOptions, local_root: &Path) -> Result<(), S
             local_root.display()
         ),
     )
-    .map_err(|error| format!("无法保存同步完成状态：{error}"))
+    .map_err(|error| format!("无法写入同步状态：{error}"))?;
+    fs::rename(&temporary, marker).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        format!("无法保存同步状态：{error}")
+    })
 }
 
-fn completion_marker(options: &SyncOptions, local_root: &Path) -> Option<PathBuf> {
+fn state_marker(options: &SyncOptions, local_root: &Path, suffix: &str) -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     let identity = format!(
         "{}@{}:{}|{}|{}",
@@ -255,7 +298,7 @@ fn completion_marker(options: &SyncOptions, local_root: &Path) -> Option<PathBuf
     }
     Some(
         home.join("Library/Application Support/我的 Mac 设置和开发工具安装/sync-state")
-            .join(format!("{hash:016x}.complete")),
+            .join(format!("{hash:016x}.{suffix}")),
     )
 }
 
@@ -305,27 +348,14 @@ fn run_sync_inner(
 
     send_status(tx, "正在扫描远端文件清单；大量小文件需要先完成索引…");
     let inventory = scan_remote(options, cancel, tx)?;
-    if inventory.file_count == 0 {
-        return Ok(format!(
-            "远端目录没有普通文件。已确认空目录 {} 可用。",
-            inventory.root
-        ));
-    }
-
     let local_root = expand_local_path(&options.local_path)?;
+    validate_local_destination(&local_root, options.delete_missing)?;
     fs::create_dir_all(&local_root)
         .map_err(|error| format!("无法创建本地目录 {}：{error}", local_root.display()))?;
     let small_file_mode = inventory.total_bytes < inventory.file_count.saturating_mul(1024 * 1024);
-    let first_copy = !has_completed_copy(options, &local_root);
-    let (results, engine, lanes) = if first_copy {
-        send_status(
-            tx,
-            "索引完成。首次同步启用单路 tar 流镜像；实测比 4 路 openrsync 快，并会立即显示字节进度。",
-        );
-        let results = run_stream_archive(options, &local_root, &inventory, cancel, tx, started)?;
-        mark_completed_copy(options, &local_root)?;
-        (results, "tar 流", 1)
-    } else {
+    let completed_copy = has_completed_copy(options, &local_root);
+    let interrupted_copy = has_partial_copy(options, &local_root);
+    let (results, engine, lanes) = if completed_copy {
         let batches = plan_batches_with_mode(&inventory.entries, options.jobs, small_file_mode);
         let batch_count = batches.len();
         send_status(
@@ -347,8 +377,37 @@ fn run_sync_inner(
             started,
             small_file_mode,
         )?;
-        mark_completed_copy(options, &local_root)?;
         (results, "openrsync 增量", batch_count)
+    } else if interrupted_copy {
+        send_status(
+            tx,
+            "检测到上次未完成的传输。正在通过 openrsync 校验并补齐已有内容…",
+        );
+        let batches = plan_batches_with_mode(&inventory.entries, options.jobs, small_file_mode);
+        let batch_count = batches.len();
+        let results = run_batches(
+            options,
+            &local_root,
+            &inventory,
+            batches,
+            cancel,
+            tx,
+            started,
+            small_file_mode,
+        )?;
+        mark_completed_copy(options, &local_root)?;
+        clear_partial_copy(options, &local_root)?;
+        (results, "openrsync 断点补齐", batch_count)
+    } else {
+        send_status(
+            tx,
+            "索引完成。首次同步启用单路 tar 流镜像；实测比 4 路 openrsync 快，并会立即显示字节进度。",
+        );
+        mark_partial_copy(options, &local_root)?;
+        let results = run_stream_archive(options, &local_root, &inventory, cancel, tx, started)?;
+        mark_completed_copy(options, &local_root)?;
+        clear_partial_copy(options, &local_root)?;
+        (results, "tar 流", 1)
     };
 
     if cancel.load(Ordering::Relaxed) {
@@ -538,6 +597,14 @@ fn run_batches(
     small_file_mode: bool,
 ) -> Result<BatchResults, String> {
     let batch_count = batches.len();
+    if batch_count == 0 {
+        send_completed_progress(tx, inventory, started, small_file_mode);
+        return Ok(BatchResults {
+            files: 0,
+            bytes: 0,
+            rate: 0,
+        });
+    }
     let (worker_tx, worker_rx): (Sender<WorkerMessage>, Receiver<WorkerMessage>) = mpsc::channel();
     let mut handles = Vec::with_capacity(batch_count);
     for (batch_index, batch) in batches.iter().cloned().enumerate() {
@@ -563,7 +630,8 @@ fn run_batches(
     let mut active = batch_count;
     let mut completed_items = vec![0_u64; batch_count];
     let mut completed_bytes = vec![0_u64; batch_count];
-    let mut failed = Vec::new();
+    let mut batch_errors = vec![Vec::<String>::new(); batch_count];
+    let mut worker_failures = Vec::new();
     let mut last_emit = Instant::now() - Duration::from_secs(1);
     let mut cancelled = false;
 
@@ -596,7 +664,7 @@ fn run_batches(
                 }
             }
             Ok(WorkerMessage::Error { batch, line }) => {
-                failed.push(format!("批次 {}：{}", batch + 1, line));
+                batch_errors[batch].push(line);
             }
             Ok(WorkerMessage::Finished {
                 batch,
@@ -610,6 +678,7 @@ fn run_batches(
                 if success {
                     completed_items[batch] = items;
                     completed_bytes[batch] = bytes;
+                    batch_errors[batch].clear();
                 }
                 send_progress(
                     tx,
@@ -639,19 +708,40 @@ fn run_batches(
                     last_emit = Instant::now();
                 }
             }
-            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Disconnected) => {
+                worker_failures.push("同步工作线程通信意外结束。".to_string());
+                break;
+            }
         }
     }
 
     for handle in handles {
         if handle.join().is_err() {
-            failed.push("同步工作线程异常退出。".to_string());
+            worker_failures.push("同步工作线程异常退出。".to_string());
         }
     }
 
     if cancelled {
         return Err("同步已停止；已完成的文件会保留。".to_string());
     }
+    let mut failed = batch_errors
+        .into_iter()
+        .enumerate()
+        .filter(|(_, errors)| !errors.is_empty())
+        .map(|(batch, errors)| {
+            format!(
+                "批次 {}：{}",
+                batch + 1,
+                errors
+                    .into_iter()
+                    .rev()
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .join("；")
+            )
+        })
+        .collect::<Vec<_>>();
+    failed.extend(worker_failures);
     if !failed.is_empty() {
         let detail = failed
             .into_iter()
@@ -704,15 +794,18 @@ fn run_batch(
         }
     };
 
-    if let Some(mut stdin) = child.stdin.take() {
-        for entry in &batch.entries {
-            if stdin.write_all(entry.relative_path.as_bytes()).is_err()
-                || stdin.write_all(&[0]).is_err()
-            {
-                break;
+    let stdin_writer = child.stdin.take().map(|mut stdin| {
+        let entries = batch.entries.clone();
+        thread::spawn(move || {
+            for entry in entries {
+                if stdin.write_all(entry.relative_path.as_bytes()).is_err()
+                    || stdin.write_all(&[0]).is_err()
+                {
+                    break;
+                }
             }
-        }
-    }
+        })
+    });
 
     let stdout_reader = child.stdout.take().map(|stdout| {
         let sender = sender.clone();
@@ -767,6 +860,9 @@ fn run_batch(
     if let Some(reader) = stderr_reader {
         let _ = reader.join();
     }
+    if let Some(reader) = stdin_writer {
+        let _ = reader.join();
+    }
     let success = status.map(|status| status.success()).unwrap_or(false);
     let _ = sender.send(WorkerMessage::Finished {
         batch: batch_index,
@@ -781,7 +877,9 @@ fn rsync_command(options: &SyncOptions, source_root: &str, local_root: &Path) ->
     let mut command = Command::new("/usr/bin/rsync");
     command
         .arg("-aE")
+        .arg("--no-r")
         .arg("--partial")
+        .arg("--partial-dir=.mymac-partial")
         .arg("--rsync-path=/usr/bin/caffeinate -i /usr/bin/rsync")
         .arg("--8-bit-output")
         .arg("--from0")
@@ -976,35 +1074,41 @@ fn plan_batches_with_mode(
     jobs: usize,
     small_file_mode: bool,
 ) -> Vec<Batch> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let count = jobs.clamp(1, 8).min(entries.len().max(1));
+    if small_file_mode {
+        let mut entries = entries.to_vec();
+        entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        let chunk_size = entries.len().div_ceil(count);
+        return entries
+            .chunks(chunk_size)
+            .map(|chunk| make_batch(chunk.to_vec()))
+            .collect();
+    }
+
     let mut files = entries
         .iter()
         .filter(|entry| entry.kind != EntryKind::Directory)
         .cloned()
         .collect::<Vec<_>>();
+    let directories = entries
+        .iter()
+        .filter(|entry| entry.kind == EntryKind::Directory)
+        .cloned()
+        .collect::<Vec<_>>();
     if files.is_empty() {
-        return Vec::new();
-    }
-    let count = jobs.clamp(1, 8).min(files.len().max(1));
-    if small_file_mode {
-        files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-        let chunk_size = files.len().div_ceil(count);
-        return files
+        let chunk_size = directories.len().div_ceil(count);
+        return directories
             .chunks(chunk_size)
-            .map(|chunk| Batch {
-                entries: chunk.to_vec(),
-                file_count: chunk.len() as u64,
-                total_bytes: chunk.iter().map(|entry| entry.size).sum(),
-            })
+            .map(|chunk| make_batch(chunk.to_vec()))
             .collect();
     }
 
     files.sort_by_key(|entry| std::cmp::Reverse(entry.size));
     let mut batches = (0..count)
-        .map(|_| Batch {
-            entries: Vec::new(),
-            file_count: 0,
-            total_bytes: 0,
-        })
+        .map(|_| make_batch(Vec::new()))
         .collect::<Vec<_>>();
     for entry in files {
         let index = batches
@@ -1017,8 +1121,34 @@ fn plan_batches_with_mode(
         batches[index].total_bytes = batches[index].total_bytes.saturating_add(entry.size);
         batches[index].entries.push(entry);
     }
+    for entry in directories {
+        let index = batches
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, batch)| batch.entries.len())
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        batches[index].entries.push(entry);
+    }
     batches.retain(|batch| !batch.entries.is_empty());
     batches
+}
+
+fn make_batch(entries: Vec<RemoteEntry>) -> Batch {
+    let file_count = entries
+        .iter()
+        .filter(|entry| entry.kind == EntryKind::File)
+        .count() as u64;
+    let total_bytes = entries
+        .iter()
+        .filter(|entry| entry.kind == EntryKind::File)
+        .map(|entry| entry.size)
+        .sum();
+    Batch {
+        entries,
+        file_count,
+        total_bytes,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1089,6 +1219,29 @@ fn send_stream_progress(
     }));
 }
 
+fn send_completed_progress(
+    tx: &Sender<SyncEvent>,
+    inventory: &Inventory,
+    started: Instant,
+    small_file_mode: bool,
+) {
+    let elapsed = started.elapsed();
+    let rate = (inventory.total_bytes as f64 / elapsed.as_secs_f64().max(0.001)) as u64;
+    let _ = tx.send(SyncEvent::Progress(SyncProgress {
+        processed_files: inventory.file_count,
+        total_files: inventory.file_count,
+        completed_bytes: inventory.total_bytes,
+        total_bytes: inventory.total_bytes,
+        active_batches: 0,
+        batch_count: 0,
+        elapsed,
+        percent: 100.0,
+        rate_bytes_per_second: rate,
+        small_file_mode,
+        stream_mode: false,
+    }));
+}
+
 fn is_file_transfer_path(path: &str, directories: &HashSet<String>) -> bool {
     let normalized = path.trim_start_matches("./").trim_end_matches('/');
     !path.ends_with('/') && !normalized.is_empty() && !directories.contains(normalized)
@@ -1122,6 +1275,42 @@ fn validate_options(options: &SyncOptions) -> Result<(), String> {
         return Err("本地目录不能为空。".to_string());
     }
     Ok(())
+}
+
+fn validate_local_destination(path: &Path, _delete_missing: bool) -> Result<(), String> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "无法读取当前用户目录。".to_string())?;
+    let normalized_path = normalize_existing_ancestor(path);
+    let normalized_home = normalize_existing_ancestor(&home);
+    if destination_is_unsafe(&normalized_path, &normalized_home) {
+        return Err(format!(
+            "本地目标是系统或用户目录的上级目录，已拒绝以免覆盖数据：{}",
+            normalized_path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_existing_ancestor(path: &Path) -> PathBuf {
+    let mut ancestor = path;
+    while !ancestor.exists() {
+        let Some(parent) = ancestor.parent() else {
+            return path.to_path_buf();
+        };
+        ancestor = parent;
+    }
+    let Ok(canonical) = ancestor.canonicalize() else {
+        return path.to_path_buf();
+    };
+    let Ok(suffix) = path.strip_prefix(ancestor) else {
+        return path.to_path_buf();
+    };
+    canonical.join(suffix)
+}
+
+fn destination_is_unsafe(path: &Path, home: &Path) -> bool {
+    path == Path::new("/") || path == home || home.starts_with(path)
 }
 
 fn ssh_command(options: &SyncOptions) -> Command {
@@ -1348,6 +1537,64 @@ mod tests {
     }
 
     #[test]
+    fn directory_entries_are_included_without_counting_them_as_files() {
+        let entries = vec![
+            RemoteEntry {
+                relative_path: "empty".to_string(),
+                kind: EntryKind::Directory,
+                size: 0,
+            },
+            RemoteEntry {
+                relative_path: "empty/file.txt".to_string(),
+                kind: EntryKind::File,
+                size: 12,
+            },
+        ];
+        let batches = plan_batches_with_mode(&entries, 1, false);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].entries.len(), 2);
+        assert_eq!(batches[0].file_count, 1);
+        assert_eq!(batches[0].total_bytes, 12);
+    }
+
+    #[test]
+    fn directory_only_inventory_still_creates_a_batch() {
+        let entries = vec![
+            RemoteEntry {
+                relative_path: "empty".to_string(),
+                kind: EntryKind::Directory,
+                size: 0,
+            },
+            RemoteEntry {
+                relative_path: "empty/nested".to_string(),
+                kind: EntryKind::Directory,
+                size: 0,
+            },
+        ];
+        let batches = plan_batches_with_mode(&entries, 2, true);
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| batch.entries.len())
+                .sum::<usize>(),
+            2
+        );
+        assert!(batches.iter().all(|batch| batch.file_count == 0));
+    }
+
+    #[test]
+    fn unsafe_destination_rejects_home_and_ancestors() {
+        let home = Path::new("/Users/example");
+        assert!(destination_is_unsafe(Path::new("/"), home));
+        assert!(destination_is_unsafe(Path::new("/Users"), home));
+        assert!(destination_is_unsafe(home, home));
+        assert!(!destination_is_unsafe(
+            Path::new("/Users/example/Desktop/backup"),
+            home
+        ));
+    }
+
+    #[test]
     fn parses_openrsync_output() {
         assert_eq!(parse_xfer_size("XFER|4096|a.txt"), Some(4096));
         assert_eq!(
@@ -1370,7 +1617,19 @@ mod tests {
         fs::create_dir_all(&source).unwrap();
         fs::create_dir_all(&destination).unwrap();
 
-        let mut entries = Vec::new();
+        fs::create_dir_all(source.join("empty/nested")).unwrap();
+        let mut entries = vec![
+            RemoteEntry {
+                relative_path: "empty".to_string(),
+                kind: EntryKind::Directory,
+                size: 0,
+            },
+            RemoteEntry {
+                relative_path: "empty/nested".to_string(),
+                kind: EntryKind::Directory,
+                size: 0,
+            },
+        ];
         for directory in 0..8 {
             let directory_path = source.join(format!("folder-{directory}"));
             fs::create_dir_all(&directory_path).unwrap();
@@ -1394,7 +1653,13 @@ mod tests {
                 let destination = destination.clone();
                 thread::spawn(move || {
                     let mut child = Command::new("/usr/bin/rsync")
-                        .args(["-aE", "--from0", "--files-from=-"])
+                        .args([
+                            "-aE",
+                            "--no-r",
+                            "--partial-dir=.mymac-partial",
+                            "--from0",
+                            "--files-from=-",
+                        ])
                         .arg(ensure_trailing_slash(&source))
                         .arg(ensure_trailing_slash(&destination))
                         .stdin(Stdio::piped())
@@ -1415,7 +1680,8 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
-        for entry in &entries {
+        assert!(destination.join("empty/nested").is_dir());
+        for entry in entries.iter().filter(|entry| entry.kind == EntryKind::File) {
             assert_eq!(
                 fs::read(destination.join(&entry.relative_path))
                     .unwrap()

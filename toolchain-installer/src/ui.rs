@@ -12,7 +12,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const TAB_ALL: usize = 0;
 const TAB_DISPLAY: usize = 1;
@@ -125,10 +125,20 @@ struct SyncUi {
     total_bytes: Signal<u64>,
     rate: Signal<String>,
     elapsed: Signal<String>,
+    heartbeat: Signal<String>,
     batch_summary: Signal<String>,
     running: Signal<bool>,
     success: Signal<bool>,
     cancel: Arc<AtomicBool>,
+    runtime: Arc<Mutex<SyncUiRuntime>>,
+}
+
+#[derive(Default)]
+struct SyncUiRuntime {
+    started_at: Option<Instant>,
+    last_movement_at: Option<Instant>,
+    last_heartbeat_at: Option<Instant>,
+    latest_progress: Option<SyncProgress>,
 }
 
 fn initial_tasks() -> Vec<InstallTask> {
@@ -282,7 +292,9 @@ impl SyncUi {
             jobs: signal("4".to_string()),
             delete_missing: signal(false),
             status: signal("准备连接另一台 Mac。首次使用请先配置 SSH 免密登录。".to_string()),
-            detail: signal("首次同步走单路 tar 流；完成后自动切换为增量 openrsync。".to_string()),
+            detail: signal(
+                "首次同步走单路 tar 流；中断后自动补齐，完成后切换为增量 openrsync。".to_string(),
+            ),
             progress: signal(0.0),
             processed: signal(0),
             total_files: signal(0),
@@ -290,10 +302,12 @@ impl SyncUi {
             total_bytes: signal(0),
             rate: signal("—".to_string()),
             elapsed: signal("00:00".to_string()),
+            heartbeat: signal("等待开始".to_string()),
             batch_summary: signal("尚未开始".to_string()),
             running: signal(false),
             success: signal(false),
             cancel: Arc::new(AtomicBool::new(false)),
+            runtime: Arc::new(Mutex::new(SyncUiRuntime::default())),
         }
     }
 
@@ -324,6 +338,14 @@ impl SyncUi {
 
     fn reset_progress(&self) {
         self.cancel.store(false, Ordering::Relaxed);
+        if let Ok(mut runtime) = self.runtime.lock() {
+            let now = Instant::now();
+            *runtime = SyncUiRuntime {
+                started_at: Some(now),
+                last_heartbeat_at: Some(now),
+                ..SyncUiRuntime::default()
+            };
+        }
         self.progress.set(0.0);
         self.processed.set(0);
         self.total_files.set(0);
@@ -331,6 +353,7 @@ impl SyncUi {
         self.total_bytes.set(0);
         self.rate.set("—".to_string());
         self.elapsed.set("00:00".to_string());
+        self.heartbeat.set("刚启动 · 正在建立 SSH 会话".to_string());
         self.batch_summary.set("正在准备".to_string());
         self.success.set(false);
     }
@@ -372,8 +395,9 @@ impl SyncUi {
         self.reset_progress();
         self.running.set(true);
         self.status.set("正在连接并建立远端文件索引…".to_string());
-        self.detail
-            .set("首次同步使用实测更快的单路 tar 流；后续使用多路增量 openrsync。".to_string());
+        self.detail.set(
+            "首次使用高速 tar 流；若中断，再次开始会校验并补齐已有内容，不从头重传。".to_string(),
+        );
         let (tx, rx) = mpsc::channel();
         let cancel = self.cancel.clone();
         std::thread::spawn(move || sync::run_sync(options, cancel, tx));
@@ -414,46 +438,106 @@ impl SyncUi {
         spawn(async move {
             loop {
                 let receiver = rx.clone();
-                let event = blocking(move || {
-                    receiver
-                        .lock()
-                        .expect("sync event receiver poisoned")
-                        .recv_timeout(Duration::from_millis(150))
-                })
-                .await;
-                let Ok(event) = event else {
+                let batch = blocking(move || drain_sync_events(&receiver)).await;
+                let Ok((events, disconnected)) = batch else {
                     ui.running.set(false);
                     return;
                 };
-                match event {
-                    Ok(SyncEvent::Status(message)) => ui.status.set(message),
-                    Ok(SyncEvent::Progress(progress)) => apply_sync_progress(&ui, progress),
-                    Ok(SyncEvent::Finished { success, message }) => {
-                        ui.running.set(false);
-                        ui.success.set(success);
-                        ui.status.set(message.clone());
-                        ui.detail.set(if success {
-                            "同步会话已结束。再次运行只会传输发生变化的内容。".to_string()
-                        } else {
-                            message
-                        });
-                        if success {
-                            ui.progress.set(100.0);
+                for event in events {
+                    match event {
+                        SyncEvent::Status(message) => ui.status.set(message),
+                        SyncEvent::Progress(progress) => apply_sync_progress(&ui, progress),
+                        SyncEvent::Finished { success, message } => {
+                            ui.running.set(false);
+                            ui.success.set(success);
+                            ui.status.set(message.clone());
+                            ui.detail.set(if success {
+                                "同步会话已结束。再次运行只会传输发生变化的内容。".to_string()
+                            } else {
+                                message
+                            });
+                            ui.heartbeat.set(if success {
+                                "同步完成".to_string()
+                            } else {
+                                "同步已停止".to_string()
+                            });
+                            if success {
+                                ui.progress.set(100.0);
+                            }
+                            return;
                         }
-                        return;
-                    }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        ui.running.set(false);
-                        return;
                     }
                 }
+                if disconnected {
+                    ui.running.set(false);
+                    return;
+                }
+                ui.tick_heartbeat();
             }
         });
+    }
+
+    fn tick_heartbeat(&self) {
+        if !self.running.get() {
+            return;
+        }
+        let now = Instant::now();
+        let (started_at, last_movement_at, latest_progress) = {
+            let Ok(mut runtime) = self.runtime.lock() else {
+                return;
+            };
+            if runtime
+                .last_heartbeat_at
+                .is_some_and(|last| now.duration_since(last) < Duration::from_secs(1))
+            {
+                return;
+            }
+            runtime.last_heartbeat_at = Some(now);
+            (
+                runtime.started_at,
+                runtime.last_movement_at,
+                runtime.latest_progress.clone(),
+            )
+        };
+
+        if let Some(started_at) = started_at {
+            let seconds = started_at.elapsed().as_secs();
+            self.elapsed
+                .set(format!("{:02}:{:02}", seconds / 60, seconds % 60));
+        }
+
+        match (latest_progress, last_movement_at) {
+            (Some(progress), Some(last_movement)) => {
+                let idle = now.duration_since(last_movement);
+                self.detail.set(sync_progress_detail(&progress, Some(idle)));
+                self.heartbeat.set(if idle < Duration::from_secs(5) {
+                    format!("界面刷新正常 · {} 秒前收到新数据", idle.as_secs().max(1))
+                } else if idle < Duration::from_secs(15) {
+                    format!("等待远端数据 · 已 {} 秒没有新字节", idle.as_secs())
+                } else {
+                    format!(
+                        "任务仍在等待 · 已 {} 秒没有新字节；SSH 会话未退出",
+                        idle.as_secs()
+                    )
+                });
+            }
+            _ => {
+                let seconds = started_at.map_or(0, |started| started.elapsed().as_secs());
+                self.heartbeat.set(format!(
+                    "界面刷新正常 · 正在执行当前阶段 · 已运行 {seconds} 秒"
+                ));
+            }
+        }
     }
 }
 
 fn apply_sync_progress(ui: &SyncUi, progress: SyncProgress) {
+    if let Ok(mut runtime) = ui.runtime.lock() {
+        let now = Instant::now();
+        runtime.started_at.get_or_insert(now);
+        runtime.last_movement_at = Some(now);
+        runtime.latest_progress = Some(progress.clone());
+    }
     ui.progress.set(progress.percent);
     ui.processed.set(progress.processed_files);
     ui.total_files.set(progress.total_files);
@@ -466,7 +550,9 @@ fn apply_sync_progress(ui: &SyncUi, progress: SyncProgress) {
     let seconds = progress.elapsed.as_secs();
     ui.elapsed
         .set(format!("{:02}:{:02}", seconds / 60, seconds % 60));
-    ui.batch_summary.set(if progress.stream_mode {
+    ui.batch_summary.set(if progress.percent >= 100.0 {
+        "已完成".to_string()
+    } else if progress.stream_mode {
         "单路 tar 流镜像".to_string()
     } else {
         format!(
@@ -480,22 +566,68 @@ fn apply_sync_progress(ui: &SyncUi, progress: SyncProgress) {
             }
         )
     });
-    ui.detail
-        .set(if progress.stream_mode && progress.percent < 100.0 {
-            format!(
-                "高速流式镜像 · {} / {}；文件计数将在解包完成后确认",
-                format_bytes(progress.completed_bytes),
-                format_bytes(progress.total_bytes)
-            )
-        } else {
-            format!(
-                "{} / {} 个文件 · {} / {}",
-                progress.processed_files,
-                progress.total_files,
-                format_bytes(progress.completed_bytes),
-                format_bytes(progress.total_bytes)
-            )
-        });
+    ui.detail.set(sync_progress_detail(&progress, None));
+    ui.heartbeat
+        .set("界面刷新正常 · 刚刚收到新数据".to_string());
+}
+
+fn drain_sync_events(rx: &Arc<Mutex<Receiver<SyncEvent>>>) -> (Vec<SyncEvent>, bool) {
+    let receiver = rx.lock().expect("sync event receiver poisoned");
+    match receiver.recv_timeout(Duration::from_millis(150)) {
+        Ok(event) => {
+            let mut events = vec![event];
+            while let Ok(event) = receiver.try_recv() {
+                events.push(event);
+            }
+            (events, false)
+        }
+        Err(RecvTimeoutError::Timeout) => (Vec::new(), false),
+        Err(RecvTimeoutError::Disconnected) => (Vec::new(), true),
+    }
+}
+
+fn sync_progress_detail(progress: &SyncProgress, idle: Option<Duration>) -> String {
+    let eta = estimated_remaining(progress)
+        .map(|value| format!(" · 预计剩余 {value}"))
+        .unwrap_or_default();
+    let idle = idle
+        .filter(|idle| *idle >= Duration::from_secs(5))
+        .map(|idle| format!(" · 已 {} 秒没有新字节", idle.as_secs()))
+        .unwrap_or_default();
+    if progress.stream_mode && progress.percent < 100.0 {
+        format!(
+            "高速流式镜像 · {} / {}；文件计数将在解包完成后确认{eta}{idle}",
+            format_bytes(progress.completed_bytes),
+            format_bytes(progress.total_bytes)
+        )
+    } else {
+        format!(
+            "{} / {} 个文件 · {} / {}{eta}{idle}",
+            progress.processed_files,
+            progress.total_files,
+            format_bytes(progress.completed_bytes),
+            format_bytes(progress.total_bytes)
+        )
+    }
+}
+
+fn estimated_remaining(progress: &SyncProgress) -> Option<String> {
+    if progress.percent < 1.0 || progress.percent >= 99.9 || progress.elapsed.as_secs() < 2 {
+        return None;
+    }
+    let fraction = f64::from(progress.percent / 100.0);
+    let seconds = progress.elapsed.as_secs_f64() * (1.0 - fraction) / fraction;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    let seconds = seconds.ceil() as u64;
+    Some(if seconds < 60 {
+        format!("{seconds} 秒")
+    } else if seconds < 3600 {
+        format!("{} 分 {} 秒", seconds / 60, seconds % 60)
+    } else {
+        format!("{} 小时 {} 分", seconds / 3600, seconds / 60 % 60)
+    })
 }
 
 fn action_button(label: &'static str, primary: bool, on_press: impl Fn() + 'static) -> View {
@@ -1649,7 +1781,6 @@ pub fn App() -> impl IntoElement {
 }
 
 fn sync_page(ui: SyncUi) -> AnyElement {
-    let progress = ui.progress.get();
     let running = ui.running.get();
     let delete_missing = ui.delete_missing.get();
     let check_ui = ui.clone();
@@ -1659,6 +1790,8 @@ fn sync_page(ui: SyncUi) -> AnyElement {
     let toggle_ui = ui.clone();
     let status_ui = ui.clone();
     let progress_color_ui = ui.clone();
+    let progress_text_ui = ui.clone();
+    let progress_bar_ui = ui.clone();
     let status_color = move || {
         if status_ui.success.get() {
             theme().chart_1
@@ -1794,7 +1927,9 @@ fn sync_page(ui: SyncUi) -> AnyElement {
                                     .text_color(status_color),
                             )
                             .child(
-                                text(format!("{progress:.0}%"))
+                                text(move || {
+                                    format_percent(progress_text_ui.progress.get())
+                                })
                                     .text_size(px(14.0))
                                     .font_weight(FontWeight::BOLD),
                             ),
@@ -1809,7 +1944,9 @@ fn sync_page(ui: SyncUi) -> AnyElement {
                             .child(
                                 view()
                                     .h_full()
-                                    .w(px(progress / 100.0 * 780.0))
+                                    .w(move || {
+                                        px(progress_bar_ui.progress.get() / 100.0 * 780.0)
+                                    })
                                     .rounded_full()
                                     .bg(move || {
                                         if progress_color_ui.success.get() {
@@ -1823,6 +1960,11 @@ fn sync_page(ui: SyncUi) -> AnyElement {
                     .child(
                         text(move || ui.detail.get())
                             .text_size(px(12.0))
+                            .text_color(move || theme().muted_foreground),
+                    )
+                    .child(
+                        text(move || ui.heartbeat.get())
+                            .text_size(px(11.0))
                             .text_color(move || theme().muted_foreground),
                     )
                     .child(
@@ -1853,7 +1995,7 @@ fn sync_page(ui: SyncUi) -> AnyElement {
                     )
                     .child(
                         text(
-                            "多次回传会在本机保存完成标记，只在首次或目标为空时走 tar 流；后续只做增量。程序会按路径连续切分小文件批次，减少远端目录反复遍历，并用非目录 XFER 事件修正进度计数。",
+                            "首次 tar 传输前会保存未完成状态；若中途断开，再次开始会用 openrsync 校验并补齐已完成内容，全部成功后才写入完成标记。后续按路径连续切分文件与空目录，减少远端目录反复遍历，并用非目录 XFER 事件修正进度计数。",
                         )
                         .text_size(px(12.0))
                         .text_color(move || theme().muted_foreground),
@@ -1897,6 +2039,15 @@ fn format_bytes(bytes: u64) -> String {
         format!("{} {}", bytes, UNITS[unit])
     } else {
         format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn format_percent(percent: f32) -> String {
+    let percent = percent.clamp(0.0, 100.0);
+    if percent < 1.0 {
+        format!("{percent:.2}%")
+    } else {
+        format!("{percent:.1}%")
     }
 }
 
@@ -2799,4 +2950,16 @@ fn add_process_rule_async(ui: ProcessUi, processes: Vec<ProcessInfo>) {
             ui.sync_config_signals();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_percent;
+
+    #[test]
+    fn fractional_progress_is_not_rounded_down_to_zero() {
+        assert_eq!(format_percent(0.0), "0.00%");
+        assert_eq!(format_percent(0.76), "0.76%");
+        assert_eq!(format_percent(1.04), "1.0%");
+    }
 }

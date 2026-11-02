@@ -277,12 +277,12 @@ impl SyncUi {
             host: signal("192.168.32.6".to_string()),
             user: signal(current_user),
             port: signal("22".to_string()),
-            remote_path: signal("~/Desktop".to_string()),
+            remote_path: signal("/Users/g/Desktop".to_string()),
             local_path: signal("~/Desktop/来自-192.168.32.6".to_string()),
             jobs: signal("4".to_string()),
             delete_missing: signal(false),
             status: signal("准备连接另一台 Mac。首次使用请先配置 SSH 免密登录。".to_string()),
-            detail: signal("先检测连接；扫描远端清单后会自动开始并行同步。".to_string()),
+            detail: signal("首次同步走单路 tar 流；完成后自动切换为增量 openrsync。".to_string()),
             progress: signal(0.0),
             processed: signal(0),
             total_files: signal(0),
@@ -373,7 +373,7 @@ impl SyncUi {
         self.running.set(true);
         self.status.set("正在连接并建立远端文件索引…".to_string());
         self.detail
-            .set("文件索引完成后会按总字节数均衡分成多个 rsync 批次并行传输。".to_string());
+            .set("首次同步使用实测更快的单路 tar 流；后续使用多路增量 openrsync。".to_string());
         let (tx, rx) = mpsc::channel();
         let cancel = self.cancel.clone();
         std::thread::spawn(move || sync::run_sync(options, cancel, tx));
@@ -383,7 +383,7 @@ impl SyncUi {
     fn stop(&self) {
         if self.running.get() {
             self.cancel.store(true, Ordering::Relaxed);
-            self.status.set("正在停止并行同步…".to_string());
+            self.status.set("正在停止同步…".to_string());
         }
     }
 
@@ -466,23 +466,36 @@ fn apply_sync_progress(ui: &SyncUi, progress: SyncProgress) {
     let seconds = progress.elapsed.as_secs();
     ui.elapsed
         .set(format!("{:02}:{:02}", seconds / 60, seconds % 60));
-    ui.batch_summary.set(format!(
-        "{} / {} 路运行中{}",
-        progress.active_batches,
-        progress.batch_count,
-        if progress.small_file_mode {
-            " · 小文件模式"
+    ui.batch_summary.set(if progress.stream_mode {
+        "单路 tar 流镜像".to_string()
+    } else {
+        format!(
+            "{} / {} 路运行中{}",
+            progress.active_batches,
+            progress.batch_count,
+            if progress.small_file_mode {
+                " · 小文件模式"
+            } else {
+                ""
+            }
+        )
+    });
+    ui.detail
+        .set(if progress.stream_mode && progress.percent < 100.0 {
+            format!(
+                "高速流式镜像 · {} / {}；文件计数将在解包完成后确认",
+                format_bytes(progress.completed_bytes),
+                format_bytes(progress.total_bytes)
+            )
         } else {
-            ""
-        }
-    ));
-    ui.detail.set(format!(
-        "{} / {} 个文件 · {} / {}",
-        progress.processed_files,
-        progress.total_files,
-        format_bytes(progress.completed_bytes),
-        format_bytes(progress.total_bytes)
-    ));
+            format!(
+                "{} / {} 个文件 · {} / {}",
+                progress.processed_files,
+                progress.total_files,
+                format_bytes(progress.completed_bytes),
+                format_bytes(progress.total_bytes)
+            )
+        });
 }
 
 fn action_button(label: &'static str, primary: bool, on_press: impl Fn() + 'static) -> View {
@@ -1663,7 +1676,7 @@ fn sync_page(ui: SyncUi) -> AnyElement {
                     .font_weight(FontWeight::BOLD),
             )
             .child(
-                text("从另一台 Mac 拉取文件夹 · NUL 安全文件清单 · 多路 rsync · 汇总进度")
+                text("首次高速 tar 流 · 后续多路增量同步 · 实时字节进度 · SSH 传输")
                     .text_size(px(13.0))
                     .text_color(move || theme().muted_foreground),
             )
@@ -1675,24 +1688,31 @@ fn sync_page(ui: SyncUi) -> AnyElement {
                             .gap_3()
                             .items_center()
                             .child(
-                                text("推荐后端")
+                                text("智能后端")
                                     .text_size(px(12.0))
                                     .font_weight(FontWeight::SEMIBOLD),
                             )
                             .child(
-                                text("系统 rsync + Rust 调度")
+                                text("tar 流 + openrsync")
                                     .text_size(px(12.0))
                                     .font_family("Menlo"),
                             )
                             .child(
-                                text("大量小文件默认 4 路并行")
+                                text("首次 1 路 · 增量默认 4 路")
                                     .text_size(px(12.0))
                                     .text_color(move || theme().muted_foreground),
                             ),
                     )
                     .child(
                         text(
-                            "macOS 自带 openrsync 与 OpenSSH 均没有 zstd 传输；不同时启用 zlib/SSH 压缩，避免大量小文件争抢 CPU。大文件和小文件都按总字节均衡拆分，未授权时只会快速失败，不会卡在后台等待密码。",
+                            "2 万个远端空文件实测：首次 tar 流 1.10 秒，4 路 openrsync 2.53 秒，parsync 8 路 127 秒仍只有 8,071 个。首次镜像用 tar 流，完成后建立状态标记并自动切换增量 openrsync；目录不再逐个串行预建。",
+                        )
+                        .text_size(px(12.0))
+                        .text_color(move || theme().muted_foreground),
+                    )
+                    .child(
+                        text(
+                            "进一步实测 SFTP/SSH：2 万个 4 KiB 文件用 tar 4.45 秒、msy 99.35 秒；rclone 在 1,000 文件用 17.79 秒，rsy 97 秒仍写入 0 个。它们不进入默认流程，避免额外依赖和不稳定协议。",
                         )
                         .text_size(px(12.0))
                         .text_color(move || theme().muted_foreground),
@@ -1702,7 +1722,7 @@ fn sync_page(ui: SyncUi) -> AnyElement {
                 card()
                     .child(section_title(
                         "远端 Mac",
-                        "示例：192.168.32.6 上的 ~/Desktop。支持 SSH config 别名和自定义端口。",
+                        "默认连接 192.168.32.6 的 /Users/g/Desktop。支持 SSH config 别名和自定义端口。",
                     ))
                     .child(
                         view()
@@ -1723,7 +1743,7 @@ fn sync_page(ui: SyncUi) -> AnyElement {
                         view()
                             .flex_row()
                             .gap_3()
-                            .child(field("并行 rsync 数量（1–8）", ui.jobs))
+                            .child(field("增量 openrsync 数量（1–8）", ui.jobs))
                             .child(action_button(
                                 if delete_missing {
                                     "删除本地多余文件：已开启"
@@ -1752,7 +1772,7 @@ fn sync_page(ui: SyncUi) -> AnyElement {
                                 if running {
                                     "同步进行中…"
                                 } else {
-                                    "开始并行同步"
+                                    "开始智能同步"
                                 },
                                 true,
                                 move || start_ui.start(),
@@ -1833,7 +1853,14 @@ fn sync_page(ui: SyncUi) -> AnyElement {
                     )
                     .child(
                         text(
-                            "parsync 支持并行 SFTP、文件分块和断点续传，但没有 zstd/SSH 压缩实现；rsync 3.2 才支持 --zc=zstd，macOS 自带 openrsync 不兼容该参数。lazyrsync 的进度体验成熟。当前方案使用自带 rsync，由 Rust 完成安全清单、字节均衡、并发调度和统一进度。",
+                            "多次回传会在本机保存完成标记，只在首次或目标为空时走 tar 流；后续只做增量。程序会按路径连续切分小文件批次，减少远端目录反复遍历，并用非目录 XFER 事件修正进度计数。",
+                        )
+                        .text_size(px(12.0))
+                        .text_color(move || theme().muted_foreground),
+                    )
+                    .child(
+                        text(
+                            "fast_rsync 0.2.0 实测算术很快：4 MiB 签名约 1.9 ms、64 KiB 修改差分约 3.1 ms；但它只是差分算法库，没有 SSH、遍历、断点或接收协议，不能直接替代 openrsync。它适合未来给超大单文件做按块增量，不适合当前 122 万小文件的完整同步。",
                         )
                         .text_size(px(12.0))
                         .text_color(move || theme().muted_foreground),

@@ -1,6 +1,7 @@
 use crate::display::{self, Detection, DisplayInfo, TargetMode};
 use crate::installer::{self, Event, TaskState};
 use crate::processes::{self, KillRule, MonitorSnapshot, ProcessConfig, ProcessInfo};
+use crate::sync::{self, SyncEvent, SyncOptions, SyncProgress};
 use crate::system;
 use nsh_base::theme;
 use nsh_core::element::input;
@@ -8,6 +9,7 @@ use nsh_core::prelude::*;
 use std::env;
 use std::process::Command;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -17,6 +19,7 @@ const TAB_DISPLAY: usize = 1;
 const TAB_SYSTEM: usize = 2;
 const TAB_AUTO_START: usize = 3;
 const TAB_AUTO_CLEAN: usize = 4;
+const TAB_SYNC: usize = 5;
 
 #[derive(Clone, PartialEq)]
 struct InstallTask {
@@ -102,6 +105,30 @@ struct ProcessUi {
     rule_terms: Signal<String>,
     rule_startup: Signal<bool>,
     editing_rule: Signal<Option<usize>>,
+}
+
+#[derive(Clone)]
+struct SyncUi {
+    host: Signal<String>,
+    user: Signal<String>,
+    port: Signal<String>,
+    remote_path: Signal<String>,
+    local_path: Signal<String>,
+    jobs: Signal<String>,
+    delete_missing: Signal<bool>,
+    status: Signal<String>,
+    detail: Signal<String>,
+    progress: Signal<f32>,
+    processed: Signal<u64>,
+    total_files: Signal<u64>,
+    completed_bytes: Signal<u64>,
+    total_bytes: Signal<u64>,
+    rate: Signal<String>,
+    elapsed: Signal<String>,
+    batch_summary: Signal<String>,
+    running: Signal<bool>,
+    success: Signal<bool>,
+    cancel: Arc<AtomicBool>,
 }
 
 fn initial_tasks() -> Vec<InstallTask> {
@@ -241,6 +268,221 @@ impl ProcessUi {
             }
         });
     }
+}
+
+impl SyncUi {
+    fn new() -> Self {
+        let current_user = env::var("USER").unwrap_or_else(|_| "g".to_string());
+        Self {
+            host: signal("192.168.32.6".to_string()),
+            user: signal(current_user),
+            port: signal("22".to_string()),
+            remote_path: signal("~/Desktop".to_string()),
+            local_path: signal("~/Desktop/来自-192.168.32.6".to_string()),
+            jobs: signal("4".to_string()),
+            delete_missing: signal(false),
+            status: signal("准备连接另一台 Mac。首次使用请先配置 SSH 免密登录。".to_string()),
+            detail: signal("先检测连接；扫描远端清单后会自动开始并行同步。".to_string()),
+            progress: signal(0.0),
+            processed: signal(0),
+            total_files: signal(0),
+            completed_bytes: signal(0),
+            total_bytes: signal(0),
+            rate: signal("—".to_string()),
+            elapsed: signal("00:00".to_string()),
+            batch_summary: signal("尚未开始".to_string()),
+            running: signal(false),
+            success: signal(false),
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn options(&self) -> Result<SyncOptions, String> {
+        let port = self
+            .port
+            .get()
+            .trim()
+            .parse::<u16>()
+            .map_err(|_| "SSH 端口必须是 1–65535。".to_string())?;
+        let jobs = self
+            .jobs
+            .get()
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| "并行任务数必须是 1–8。".to_string())?
+            .clamp(1, 8);
+        Ok(SyncOptions {
+            host: self.host.get(),
+            user: self.user.get(),
+            port,
+            remote_path: self.remote_path.get(),
+            local_path: self.local_path.get(),
+            jobs,
+            delete_missing: self.delete_missing.get(),
+        })
+    }
+
+    fn reset_progress(&self) {
+        self.cancel.store(false, Ordering::Relaxed);
+        self.progress.set(0.0);
+        self.processed.set(0);
+        self.total_files.set(0);
+        self.completed_bytes.set(0);
+        self.total_bytes.set(0);
+        self.rate.set("—".to_string());
+        self.elapsed.set("00:00".to_string());
+        self.batch_summary.set("正在准备".to_string());
+        self.success.set(false);
+    }
+
+    fn test_connection(&self) {
+        if self.running.get() {
+            return;
+        }
+        let options = match self.options() {
+            Ok(options) => options,
+            Err(error) => {
+                self.status.set(error);
+                self.success.set(false);
+                return;
+            }
+        };
+        self.reset_progress();
+        self.running.set(true);
+        self.status.set("正在快速检测 SSH 和远端目录…".to_string());
+        self.detail
+            .set("使用 BatchMode，不会在后台卡住等待密码。".to_string());
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || sync::test_connection(&options, tx));
+        self.pump_events(rx);
+    }
+
+    fn start(&self) {
+        if self.running.get() {
+            return;
+        }
+        let options = match self.options() {
+            Ok(options) => options,
+            Err(error) => {
+                self.status.set(error);
+                self.success.set(false);
+                return;
+            }
+        };
+        self.reset_progress();
+        self.running.set(true);
+        self.status.set("正在连接并建立远端文件索引…".to_string());
+        self.detail
+            .set("文件索引完成后会按总字节数均衡分成多个 rsync 批次并行传输。".to_string());
+        let (tx, rx) = mpsc::channel();
+        let cancel = self.cancel.clone();
+        std::thread::spawn(move || sync::run_sync(options, cancel, tx));
+        self.pump_events(rx);
+    }
+
+    fn stop(&self) {
+        if self.running.get() {
+            self.cancel.store(true, Ordering::Relaxed);
+            self.status.set("正在停止并行同步…".to_string());
+        }
+    }
+
+    fn prepare_access(&self) {
+        let options = match self.options() {
+            Ok(options) => options,
+            Err(error) => {
+                self.status.set(error);
+                self.success.set(false);
+                return;
+            }
+        };
+        match sync::prepare_ssh_access(&options) {
+            Ok(message) => {
+                self.status.set(message);
+                self.success.set(true);
+            }
+            Err(error) => {
+                self.status.set(error);
+                self.success.set(false);
+            }
+        }
+    }
+
+    fn pump_events(&self, rx: Receiver<SyncEvent>) {
+        let ui = self.clone();
+        let rx = Arc::new(Mutex::new(rx));
+        spawn(async move {
+            loop {
+                let receiver = rx.clone();
+                let event = blocking(move || {
+                    receiver
+                        .lock()
+                        .expect("sync event receiver poisoned")
+                        .recv_timeout(Duration::from_millis(150))
+                })
+                .await;
+                let Ok(event) = event else {
+                    ui.running.set(false);
+                    return;
+                };
+                match event {
+                    Ok(SyncEvent::Status(message)) => ui.status.set(message),
+                    Ok(SyncEvent::Progress(progress)) => apply_sync_progress(&ui, progress),
+                    Ok(SyncEvent::Finished { success, message }) => {
+                        ui.running.set(false);
+                        ui.success.set(success);
+                        ui.status.set(message.clone());
+                        ui.detail.set(if success {
+                            "同步会话已结束。再次运行只会传输发生变化的内容。".to_string()
+                        } else {
+                            message
+                        });
+                        if success {
+                            ui.progress.set(100.0);
+                        }
+                        return;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        ui.running.set(false);
+                        return;
+                    }
+                }
+            }
+        });
+    }
+}
+
+fn apply_sync_progress(ui: &SyncUi, progress: SyncProgress) {
+    ui.progress.set(progress.percent);
+    ui.processed.set(progress.processed_files);
+    ui.total_files.set(progress.total_files);
+    ui.completed_bytes.set(progress.completed_bytes);
+    ui.total_bytes.set(progress.total_bytes);
+    ui.rate.set(format!(
+        "{}/s",
+        format_bytes(progress.rate_bytes_per_second)
+    ));
+    let seconds = progress.elapsed.as_secs();
+    ui.elapsed
+        .set(format!("{:02}:{:02}", seconds / 60, seconds % 60));
+    ui.batch_summary.set(format!(
+        "{} / {} 路运行中{}",
+        progress.active_batches,
+        progress.batch_count,
+        if progress.small_file_mode {
+            " · 小文件模式"
+        } else {
+            ""
+        }
+    ));
+    ui.detail.set(format!(
+        "{} / {} 个文件 · {} / {}",
+        progress.processed_files,
+        progress.total_files,
+        format_bytes(progress.completed_bytes),
+        format_bytes(progress.total_bytes)
+    ));
 }
 
 fn action_button(label: &'static str, primary: bool, on_press: impl Fn() + 'static) -> View {
@@ -424,7 +666,7 @@ fn page_shell(content: View) -> AnyElement {
         .into_element()
 }
 
-fn apply_install_event(tasks: &mut Vec<InstallTask>, event: Event) -> bool {
+fn apply_install_event(tasks: &mut [InstallTask], event: Event) -> bool {
     match event {
         Event::State {
             task,
@@ -1197,7 +1439,7 @@ pub fn App() -> impl IntoElement {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(TAB_ALL)
-        .min(TAB_AUTO_CLEAN);
+        .min(TAB_SYNC);
     let tab = signal(initial_tab);
     let tasks = signal(initial_tasks());
     let install_running = signal(false);
@@ -1253,6 +1495,7 @@ pub fn App() -> impl IntoElement {
     preflight_installed_tasks(state);
     let process_ui = ProcessUi::new();
     process_ui.start_monitor();
+    let sync_ui = SyncUi::new();
 
     spawn(async move {
         match blocking(display::detect).await {
@@ -1332,11 +1575,13 @@ pub fn App() -> impl IntoElement {
     let state_for_pages = state;
     let actions_for_pages = actions.clone();
     let process_pages = process_ui.clone();
+    let sync_pages = sync_ui.clone();
     let pages = dynamic(move || match state_for_pages.tab.get() {
         TAB_DISPLAY => display_page(state_for_pages, &actions_for_pages),
         TAB_SYSTEM => system_page(state_for_pages, &actions_for_pages),
         TAB_AUTO_START => auto_start_page(state_for_pages, process_pages.clone()),
         TAB_AUTO_CLEAN => auto_clean_page(state_for_pages, process_pages.clone()),
+        TAB_SYNC => sync_page(sync_pages.clone()),
         _ => all_page(state_for_pages, &actions_for_pages),
     });
 
@@ -1365,7 +1610,7 @@ pub fn App() -> impl IntoElement {
                         .font_weight(FontWeight::BOLD),
                 )
                 .child(
-                    text("系统代理 · PATH · 显示器修复 · 并行安装 · 实时进度")
+                    text("系统代理 · PATH · 显示器修复 · 跨 Mac 文件同步 · 实时进度")
                         .text_size(px(13.0))
                         .text_color(move || theme().muted_foreground),
                 ),
@@ -1384,9 +1629,248 @@ pub fn App() -> impl IntoElement {
                 .child(tab_button("显示器", TAB_DISPLAY, state))
                 .child(tab_button("系统设置", TAB_SYSTEM, state))
                 .child(tab_button("自动启动进程", TAB_AUTO_START, state))
-                .child(tab_button("自动清理", TAB_AUTO_CLEAN, state)),
+                .child(tab_button("自动清理", TAB_AUTO_CLEAN, state))
+                .child(tab_button("文件同步", TAB_SYNC, state)),
         )
         .child(pages)
+}
+
+fn sync_page(ui: SyncUi) -> AnyElement {
+    let progress = ui.progress.get();
+    let running = ui.running.get();
+    let delete_missing = ui.delete_missing.get();
+    let check_ui = ui.clone();
+    let start_ui = ui.clone();
+    let stop_ui = ui.clone();
+    let access_ui = ui.clone();
+    let toggle_ui = ui.clone();
+    let status_ui = ui.clone();
+    let progress_color_ui = ui.clone();
+    let status_color = move || {
+        if status_ui.success.get() {
+            theme().chart_1
+        } else {
+            theme().foreground
+        }
+    };
+
+    page_shell(
+        view()
+            .gap_2()
+            .child(
+                text("文件同步")
+                    .text_size(px(28.0))
+                    .font_weight(FontWeight::BOLD),
+            )
+            .child(
+                text("从另一台 Mac 拉取文件夹 · NUL 安全文件清单 · 多路 rsync · 汇总进度")
+                    .text_size(px(13.0))
+                    .text_color(move || theme().muted_foreground),
+            )
+            .child(
+                muted_card()
+                    .child(
+                        view()
+                            .flex_row()
+                            .gap_3()
+                            .items_center()
+                            .child(
+                                text("推荐后端")
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::SEMIBOLD),
+                            )
+                            .child(
+                                text("系统 rsync + Rust 调度")
+                                    .text_size(px(12.0))
+                                    .font_family("Menlo"),
+                            )
+                            .child(
+                                text("大量小文件默认 4 路并行")
+                                    .text_size(px(12.0))
+                                    .text_color(move || theme().muted_foreground),
+                            ),
+                    )
+                    .child(
+                        text(
+                            "macOS 自带 openrsync 与 OpenSSH 均没有 zstd 传输；不同时启用 zlib/SSH 压缩，避免大量小文件争抢 CPU。大文件和小文件都按总字节均衡拆分，未授权时只会快速失败，不会卡在后台等待密码。",
+                        )
+                        .text_size(px(12.0))
+                        .text_color(move || theme().muted_foreground),
+                    ),
+            )
+            .child(
+                card()
+                    .child(section_title(
+                        "远端 Mac",
+                        "示例：192.168.32.6 上的 ~/Desktop。支持 SSH config 别名和自定义端口。",
+                    ))
+                    .child(
+                        view()
+                            .flex_row()
+                            .gap_3()
+                            .child(field("主机名或 IP", ui.host))
+                            .child(field("SSH 用户名", ui.user))
+                            .child(field("SSH 端口", ui.port)),
+                    )
+                    .child(
+                        view()
+                            .flex_row()
+                            .gap_3()
+                            .child(field("远端文件夹", ui.remote_path))
+                            .child(field("本地目标文件夹", ui.local_path)),
+                    )
+                    .child(
+                        view()
+                            .flex_row()
+                            .gap_3()
+                            .child(field("并行 rsync 数量（1–8）", ui.jobs))
+                            .child(action_button(
+                                if delete_missing {
+                                    "删除本地多余文件：已开启"
+                                } else {
+                                    "删除本地多余文件：已关闭"
+                                },
+                                false,
+                                move || {
+                                    toggle_ui
+                                        .delete_missing
+                                        .update(|enabled| *enabled = !*enabled);
+                                },
+                            )),
+                    )
+                    .child(
+                        view()
+                            .flex_row()
+                            .gap_2()
+                            .child(action_button("配置免密登录", false, move || {
+                                access_ui.prepare_access();
+                            }))
+                            .child(action_button("检测连接", false, move || {
+                                check_ui.test_connection();
+                            }))
+                            .child(action_button(
+                                if running {
+                                    "同步进行中…"
+                                } else {
+                                    "开始并行同步"
+                                },
+                                true,
+                                move || start_ui.start(),
+                            ))
+                            .child(action_button("停止", false, move || stop_ui.stop())),
+                    ),
+            )
+            .child(
+                card()
+                    .child(
+                        view()
+                            .flex_row()
+                            .justify_between()
+                            .items_center()
+                            .child(
+                                text(move || ui.status.get())
+                                    .text_size(px(14.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(status_color),
+                            )
+                            .child(
+                                text(format!("{progress:.0}%"))
+                                    .text_size(px(14.0))
+                                    .font_weight(FontWeight::BOLD),
+                            ),
+                    )
+                    .child(
+                        view()
+                            .w(px(780.0))
+                            .h(px(10.0))
+                            .rounded_full()
+                            .overflow_hidden()
+                            .bg(move || theme().muted)
+                            .child(
+                                view()
+                                    .h_full()
+                                    .w(px(progress / 100.0 * 780.0))
+                                    .rounded_full()
+                                    .bg(move || {
+                                        if progress_color_ui.success.get() {
+                                            theme().chart_1
+                                        } else {
+                                            theme().primary
+                                        }
+                                    }),
+                            ),
+                    )
+                    .child(
+                        text(move || ui.detail.get())
+                            .text_size(px(12.0))
+                            .text_color(move || theme().muted_foreground),
+                    )
+                    .child(
+                        view()
+                            .flex_row()
+                            .gap_4()
+                            .child(sync_stat("文件", move || {
+                                format!("{} / {}", ui.processed.get(), ui.total_files.get())
+                            }))
+                            .child(sync_stat("数据", move || {
+                                format!(
+                                    "{} / {}",
+                                    format_bytes(ui.completed_bytes.get()),
+                                    format_bytes(ui.total_bytes.get())
+                                )
+                            }))
+                            .child(sync_stat("速度", move || ui.rate.get()))
+                            .child(sync_stat("耗时", move || ui.elapsed.get()))
+                            .child(sync_stat("并行状态", move || ui.batch_summary.get())),
+                    ),
+            )
+            .child(
+                muted_card()
+                    .child(
+                        text("为什么这样选")
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::SEMIBOLD),
+                    )
+                    .child(
+                        text(
+                            "parsync 支持并行 SFTP、文件分块和断点续传，但没有 zstd/SSH 压缩实现；rsync 3.2 才支持 --zc=zstd，macOS 自带 openrsync 不兼容该参数。lazyrsync 的进度体验成熟。当前方案使用自带 rsync，由 Rust 完成安全清单、字节均衡、并发调度和统一进度。",
+                        )
+                        .text_size(px(12.0))
+                        .text_color(move || theme().muted_foreground),
+                    ),
+            ),
+    )
+}
+
+fn sync_stat(label: &'static str, value: impl Fn() -> String + 'static) -> View {
+    view()
+        .gap_1()
+        .child(
+            text(label)
+                .text_size(px(11.0))
+                .text_color(move || theme().muted_foreground),
+        )
+        .child(
+            text(value)
+                .text_size(px(12.0))
+                .font_family("Menlo")
+                .font_weight(FontWeight::SEMIBOLD),
+        )
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 fn all_page(state: UiState, actions: &Actions) -> AnyElement {

@@ -215,7 +215,7 @@ fn configure_only() -> Result<()> {
 }
 
 fn setup_environment() -> Result<()> {
-    report_stage(format!("Preparing local directories and PATH"));
+    report_stage("Preparing local directories and PATH");
     let layout = Layout::detect()?;
     layout.prepare()?;
     configure_shell(&layout)?;
@@ -566,7 +566,7 @@ fn write_npm_config(home: &Path, prefix: &Path) -> Result<()> {
     let path = home.join(".npmrc");
     let mut content = fs::read_to_string(&path).unwrap_or_default();
     content = replace_property(&content, "registry", &format!("{NPM_REGISTRY}/"));
-    content = replace_property(&content, "prefix", &path_str(prefix)?);
+    content = replace_property(&content, "prefix", path_str(prefix)?);
     content = replace_property(&content, "proxy", PROXY_URL);
     content = replace_property(&content, "https-proxy", PROXY_URL);
     content = replace_property(&content, "allow-scripts", "esbuild,workerd");
@@ -962,7 +962,7 @@ fn remote_download_info(url: &str) -> (Option<u64>, bool) {
         .lines()
         .filter_map(|line| line.strip_prefix("content-length:"))
         .filter_map(|value| value.trim().parse::<u64>().ok())
-        .last();
+        .next_back();
     let supports_ranges = headers
         .lines()
         .filter_map(|line| line.strip_prefix("accept-ranges:"))
@@ -976,11 +976,10 @@ fn download_github(url: &str, destination: &Path) -> Result<()> {
         let (size, _) = remote_download_info(&proxied);
         if let (Some(size), Ok(metadata)) =
             (size.filter(|size| *size > 0), fs::metadata(destination))
+            && metadata.len() == size
         {
-            if metadata.len() == size {
-                println!("Already downloaded: {}", destination.display());
-                return Ok(());
-            }
+            println!("Already downloaded: {}", destination.display());
+            return Ok(());
         }
         download_segmented(&proxied, destination, 8)
     } else {

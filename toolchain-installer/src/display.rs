@@ -331,7 +331,7 @@ pub fn logical_candidates(target: TargetMode) -> Vec<(u32, u32)> {
     if half_width < target.width && half_height >= 360 {
         candidates.push((half_width, half_height));
     }
-    candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    candidates.sort_unstable_by_key(|candidate| std::cmp::Reverse(candidate.0));
     candidates.dedup();
     candidates
 }
@@ -392,7 +392,7 @@ fn validate_target(target: TargetMode) -> Result<(), String> {
     if target.width > 16384 || target.height > 16384 {
         return Err("目标分辨率超出 macOS 显示覆盖的合理范围".to_string());
     }
-    if target.width % 2 != 0 || target.height % 2 != 0 {
+    if !target.width.is_multiple_of(2) || !target.height.is_multiple_of(2) {
         return Err("目标宽高必须是偶数".to_string());
     }
     if !(1..=240).contains(&target.refresh) {
@@ -491,6 +491,7 @@ fn apply_coregraphics_mode(
     type ModeRef = *mut c_void;
     type ArrayRef = *const c_void;
 
+    #[allow(clippy::duplicated_attributes)]
     #[link(name = "CoreGraphics", kind = "framework")]
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {

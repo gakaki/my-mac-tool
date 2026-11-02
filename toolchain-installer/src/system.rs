@@ -14,6 +14,8 @@ const CORNERS: [(&str, &str); 4] = [
 #[derive(Clone, Debug, PartialEq)]
 pub struct SystemStatus {
     pub active_hot_corners: Vec<String>,
+    pub dock_position: String,
+    pub finder_list_view: bool,
     pub rosetta_installed: bool,
     pub auto_login_enabled: bool,
 }
@@ -29,6 +31,8 @@ pub struct WeakPasswordOutcome {
 pub fn detect() -> Result<SystemStatus, String> {
     Ok(SystemStatus {
         active_hot_corners: active_hot_corners()?,
+        dock_position: dock_position_label()?,
+        finder_list_view: finder_list_view_enabled()?,
         rosetta_installed: rosetta_installed(),
         auto_login_enabled: auto_login_enabled()?,
     })
@@ -77,6 +81,101 @@ pub fn disable_hot_corners() -> Result<(), String> {
         }
     }
 
+    reload_dock()
+}
+
+pub fn move_dock_left() -> Result<(), String> {
+    let output = Command::new("/usr/bin/defaults")
+        .args(["write", "com.apple.dock", "orientation", "-string", "left"])
+        .output()
+        .map_err(|error| format!("无法修改 Dock 位置：{error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "无法将 Dock 移到左侧：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    reload_dock()
+}
+
+pub fn configure_finder_list_view() -> Result<(), String> {
+    for (key, value) in [
+        ("FXPreferredViewStyle", "Nlsv"),
+        ("FXPreferredSearchViewStyle", "Nlsv"),
+        ("FXArrangeGroupViewBy", "None"),
+    ] {
+        let output = Command::new("/usr/bin/defaults")
+            .args(["write", "com.apple.finder", key, "-string", value])
+            .output()
+            .map_err(|error| format!("无法修改 Finder {key}：{error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "无法修改 Finder {key}：{}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+
+    let _ = Command::new("/usr/bin/osascript")
+        .args([
+            "-e",
+            "tell application \"Finder\" to repeat with w in windows\n try\n set current view of w to list view\n end try\n end repeat",
+        ])
+        .status();
+
+    let output = Command::new("/usr/bin/killall")
+        .arg("Finder")
+        .output()
+        .map_err(|error| format!("无法重新载入 Finder：{error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "设置已写入，但 Finder 重新载入失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn dock_position_label() -> Result<String, String> {
+    let output = Command::new("/usr/bin/defaults")
+        .args(["read", "com.apple.dock", "orientation"])
+        .output()
+        .map_err(|error| format!("无法读取 Dock 位置：{error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if missing_default_key(&stderr) {
+            return Ok("Dock 位于屏幕底部".to_string());
+        }
+        return Err(format!("无法读取 Dock 位置：{}", stderr.trim()));
+    }
+    Ok(dock_label(String::from_utf8_lossy(&output.stdout).trim()).to_string())
+}
+
+fn dock_label(value: &str) -> &'static str {
+    match value {
+        "left" => "Dock 位于屏幕左侧",
+        "right" => "Dock 位于屏幕右侧",
+        _ => "Dock 位于屏幕底部",
+    }
+}
+
+fn finder_list_view_enabled() -> Result<bool, String> {
+    let output = Command::new("/usr/bin/defaults")
+        .args(["read", "com.apple.finder", "FXPreferredViewStyle"])
+        .output()
+        .map_err(|error| format!("无法读取 Finder 视图设置：{error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if missing_default_key(&stderr) {
+            return Ok(false);
+        }
+        return Err(format!("无法读取 Finder 视图设置：{}", stderr.trim()));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim() == "Nlsv")
+}
+
+fn reload_dock() -> Result<(), String> {
     let output = Command::new("/usr/bin/killall")
         .arg("Dock")
         .output()
@@ -382,5 +481,12 @@ mod tests {
     #[test]
     fn encodes_a_one_space_auto_login_password() {
         assert_eq!(encode_kcpassword(b" "), vec![0x5d]);
+    }
+
+    #[test]
+    fn labels_all_dock_orientations() {
+        assert_eq!(dock_label("left"), "Dock 位于屏幕左侧");
+        assert_eq!(dock_label("right"), "Dock 位于屏幕右侧");
+        assert_eq!(dock_label("bottom"), "Dock 位于屏幕底部");
     }
 }

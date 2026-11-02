@@ -58,6 +58,8 @@ struct UiState {
     desktop_height: Signal<String>,
     system_status: Signal<Option<system::SystemStatus>>,
     hot_corners: Signal<String>,
+    dock_position: Signal<String>,
+    finder_view: Signal<String>,
     rosetta: Signal<String>,
     auto_login: Signal<String>,
     helper_status: Signal<String>,
@@ -73,6 +75,9 @@ struct Actions {
     restore_display: Rc<dyn Fn()>,
     open_display_settings: Rc<dyn Fn()>,
     disable_hot_corners: Rc<dyn Fn()>,
+    move_dock_left: Rc<dyn Fn()>,
+    configure_finder_list_view: Rc<dyn Fn()>,
+    run_system_setup: Rc<dyn Fn()>,
     install_rosetta: Rc<dyn Fn()>,
     apply_weak_password: Rc<dyn Fn()>,
     restore_password_policy: Rc<dyn Fn()>,
@@ -789,6 +794,220 @@ fn make_actions(state: UiState) -> Actions {
         });
     });
 
+    let dock_state = state;
+    let move_dock_left = Rc::new(move || {
+        if dock_state.helper_working.get() {
+            return;
+        }
+        dock_state.helper_working.set(true);
+        dock_state.helper_error.set(false);
+        dock_state
+            .helper_status
+            .set("正在把 Dock 移到屏幕左侧…".to_string());
+        spawn(async move {
+            match blocking(system::move_dock_left).await {
+                Ok(Ok(())) => {
+                    dock_state
+                        .dock_position
+                        .set("Dock 位于屏幕左侧".to_string());
+                    dock_state
+                        .helper_status
+                        .set("Dock 已移动到屏幕左侧。".to_string());
+                }
+                Ok(Err(error)) => {
+                    dock_state.helper_status.set(error);
+                    dock_state.helper_error.set(true);
+                }
+                Err(error) => {
+                    dock_state
+                        .helper_status
+                        .set(format!("Dock 位置设置任务失败：{error}"));
+                    dock_state.helper_error.set(true);
+                }
+            }
+            dock_state.helper_working.set(false);
+        });
+    });
+
+    let finder_state = state;
+    let configure_finder_list_view = Rc::new(move || {
+        if finder_state.helper_working.get() {
+            return;
+        }
+        finder_state.helper_working.set(true);
+        finder_state.helper_error.set(false);
+        finder_state
+            .helper_status
+            .set("正在把 Finder 默认视图设为列表视图…".to_string());
+        spawn(async move {
+            match blocking(system::configure_finder_list_view).await {
+                Ok(Ok(())) => {
+                    finder_state
+                        .finder_view
+                        .set("Finder 默认使用列表视图，浏览时保持列表".to_string());
+                    finder_state
+                        .helper_status
+                        .set("Finder 已设为默认列表视图，并重新载入。".to_string());
+                }
+                Ok(Err(error)) => {
+                    finder_state.helper_status.set(error);
+                    finder_state.helper_error.set(true);
+                }
+                Err(error) => {
+                    finder_state
+                        .helper_status
+                        .set(format!("Finder 视图设置任务失败：{error}"));
+                    finder_state.helper_error.set(true);
+                }
+            }
+            finder_state.helper_working.set(false);
+        });
+    });
+
+    let setup_state = state;
+    let run_system_setup = Rc::new(move || {
+        if setup_state.helper_working.get() {
+            return;
+        }
+        setup_state.helper_working.set(true);
+        setup_state.helper_error.set(false);
+        setup_state
+            .helper_status
+            .set("一键设置 1/6：正在关闭桌面四角…".to_string());
+        spawn(async move {
+            let mut summary = Vec::new();
+            let mut failed = false;
+
+            match blocking(system::disable_hot_corners).await {
+                Ok(Ok(())) => {
+                    setup_state
+                        .hot_corners
+                        .set("桌面四角触发已全部关闭".to_string());
+                    summary.push("1/6  桌面四角已关闭".to_string());
+                }
+                Ok(Err(error)) => {
+                    failed = true;
+                    summary.push(format!("1/6  桌面四角失败：{error}"));
+                }
+                Err(error) => {
+                    failed = true;
+                    summary.push(format!("1/6  桌面四角任务失败：{error}"));
+                }
+            }
+
+            setup_state.helper_status.set(format!(
+                "{}\n2/6  正在把 Dock 移到左侧…",
+                summary.join("\n")
+            ));
+            match blocking(system::move_dock_left).await {
+                Ok(Ok(())) => {
+                    setup_state
+                        .dock_position
+                        .set("Dock 位于屏幕左侧".to_string());
+                    summary.push("2/6  Dock 已移到屏幕左侧".to_string());
+                }
+                Ok(Err(error)) => {
+                    failed = true;
+                    summary.push(format!("2/6  Dock 位置失败：{error}"));
+                }
+                Err(error) => {
+                    failed = true;
+                    summary.push(format!("2/6  Dock 位置任务失败：{error}"));
+                }
+            }
+
+            setup_state.helper_status.set(format!(
+                "{}\n3/6  正在设置 Finder 列表视图…",
+                summary.join("\n")
+            ));
+            match blocking(system::configure_finder_list_view).await {
+                Ok(Ok(())) => {
+                    setup_state
+                        .finder_view
+                        .set("Finder 默认使用列表视图，浏览时保持列表".to_string());
+                    summary.push("3/6  Finder 已设为列表视图".to_string());
+                }
+                Ok(Err(error)) => {
+                    failed = true;
+                    summary.push(format!("3/6  Finder 视图失败：{error}"));
+                }
+                Err(error) => {
+                    failed = true;
+                    summary.push(format!("3/6  Finder 视图任务失败：{error}"));
+                }
+            }
+
+            setup_state
+                .helper_status
+                .set(format!("{}\n4/6  正在安装 Rosetta 2…", summary.join("\n")));
+            match blocking(system::install_rosetta).await {
+                Ok(Ok(())) => {
+                    setup_state.rosetta.set("Rosetta 2 已安装".to_string());
+                    summary.push("4/6  Rosetta 2 已安装".to_string());
+                }
+                Ok(Err(error)) => {
+                    failed = true;
+                    summary.push(format!("4/6  Rosetta 2 失败：{error}"));
+                }
+                Err(error) => {
+                    failed = true;
+                    summary.push(format!("4/6  Rosetta 2 任务失败：{error}"));
+                }
+            }
+
+            setup_state.helper_status.set(format!(
+                "{}\n5/6  正在设置一个空格密码…",
+                summary.join("\n")
+            ));
+            match blocking(system::apply_weak_password).await {
+                Ok(Ok(outcome)) => summary.push(format!(
+                    "5/6  弱密码策略已开启并验证账户“{}”",
+                    outcome.account
+                )),
+                Ok(Err(error)) => {
+                    failed = true;
+                    summary.push(format!("5/6  弱密码设置失败：{error}"));
+                }
+                Err(error) => {
+                    failed = true;
+                    summary.push(format!("5/6  弱密码任务失败：{error}"));
+                }
+            }
+
+            setup_state
+                .helper_status
+                .set(format!("{}\n6/6  正在启用自动登录…", summary.join("\n")));
+            match blocking(system::enable_space_auto_login).await {
+                Ok(Ok(())) => {
+                    setup_state
+                        .auto_login
+                        .set("自动登录已开启，下次启动将跳过登录密码输入".to_string());
+                    summary.push("6/6  自动登录已开启".to_string());
+                }
+                Ok(Err(error)) => {
+                    failed = true;
+                    summary.push(format!("6/6  自动登录失败：{error}"));
+                }
+                Err(error) => {
+                    failed = true;
+                    summary.push(format!("6/6  自动登录任务失败：{error}"));
+                }
+            }
+
+            setup_state.helper_status.set(format!(
+                "{}：\n{}",
+                if failed {
+                    "一键设置流程已结束，部分步骤失败"
+                } else {
+                    "一键设置全部完成"
+                },
+                summary.join("\n")
+            ));
+            setup_state.helper_error.set(failed);
+            setup_state.helper_working.set(false);
+        });
+    });
+
     let rosetta_state = state;
     let install_rosetta = Rc::new(move || {
         if rosetta_state.helper_working.get() {
@@ -961,6 +1180,9 @@ fn make_actions(state: UiState) -> Actions {
         restore_display,
         open_display_settings,
         disable_hot_corners,
+        move_dock_left,
+        configure_finder_list_view,
+        run_system_setup,
         install_rosetta,
         apply_weak_password,
         restore_password_policy,
@@ -993,6 +1215,8 @@ pub fn App() -> impl IntoElement {
     let desktop_height = signal("2160".to_string());
     let system_status = signal::<Option<system::SystemStatus>>(None);
     let hot_corners = signal("正在读取四角设置…".to_string());
+    let dock_position = signal("正在读取 Dock 位置…".to_string());
+    let finder_view = signal("正在读取 Finder 视图…".to_string());
     let rosetta = signal("正在检测 Rosetta…".to_string());
     let auto_login = signal("正在检测自动登录…".to_string());
     let helper_status = signal("系统设置操作完成后会在这里显示结果。".to_string());
@@ -1017,6 +1241,8 @@ pub fn App() -> impl IntoElement {
         desktop_height,
         system_status,
         hot_corners,
+        dock_position,
+        finder_view,
         rosetta,
         auto_login,
         helper_status,
@@ -1078,6 +1304,12 @@ pub fn App() -> impl IntoElement {
                     "Rosetta 2 已安装".to_string()
                 } else {
                     "尚未检测到 Rosetta 2".to_string()
+                });
+                state.dock_position.set(detected.dock_position.clone());
+                state.finder_view.set(if detected.finder_list_view {
+                    "Finder 默认使用列表视图，浏览时保持列表".to_string()
+                } else {
+                    "Finder 尚未默认使用列表视图".to_string()
                 });
                 state.auto_login.set(if detected.auto_login_enabled {
                     "自动登录已开启".to_string()
@@ -1383,12 +1615,14 @@ fn display_page(state: UiState, actions: &Actions) -> AnyElement {
 
 fn system_page(state: UiState, actions: &Actions) -> AnyElement {
     let corners = actions.disable_hot_corners.clone();
+    let dock_left = actions.move_dock_left.clone();
+    let finder_list = actions.configure_finder_list_view.clone();
+    let run_all = actions.run_system_setup.clone();
     let rosetta = actions.install_rosetta.clone();
     let weak = actions.apply_weak_password.clone();
     let restore_policy = actions.restore_password_policy.clone();
     let auto_on = actions.enable_auto_login.clone();
     let auto_off = actions.disable_auto_login.clone();
-    let setup_task = state.tasks.get().into_iter().next();
     page_shell(
         view()
             .gap_2()
@@ -1398,32 +1632,9 @@ fn system_page(state: UiState, actions: &Actions) -> AnyElement {
                     .font_weight(FontWeight::BOLD),
             )
             .child(
-                text("代理、PATH、镜像与 macOS 辅助设置")
+                text("macOS 辅助设置")
                     .text_size(px(13.0))
                     .text_color(move || theme().muted_foreground),
-            )
-            .child(
-                card()
-                    .child(section_title(
-                        "系统代理与开发环境",
-                        "Wi-Fi 的 HTTP、HTTPS、SOCKS 代理均指向 127.0.0.1:7890。",
-                    ))
-                    .child(
-                        view()
-                            .flex_row()
-                            .gap_2()
-                            .child(text("PATH").text_size(px(12.0)))
-                            .child(
-                                text("~/.local/bin")
-                                    .font_family("Menlo")
-                                    .text_size(px(12.0)),
-                            )
-                            .child(text("Rust").text_size(px(12.0)))
-                            .child(text("rsproxy.cn").font_family("Menlo").text_size(px(12.0)))
-                            .child(text("Go").text_size(px(12.0)))
-                            .child(text("goproxy.cn").font_family("Menlo").text_size(px(12.0))),
-                    )
-                    .when_some(setup_task, |this, task| this.child(progress_row(task))),
             )
             .child(
                 card()
@@ -1431,6 +1642,21 @@ fn system_page(state: UiState, actions: &Actions) -> AnyElement {
                         "macOS 辅助设置",
                         "需要管理员权限时会使用 macOS 原生授权窗口。",
                     ))
+                    .child(
+                        muted_card()
+                            .child(
+                                text("一键设置全部")
+                                    .text_size(px(14.0))
+                                    .font_weight(FontWeight::SEMIBOLD),
+                            )
+                            .child(
+                                text("关闭四角 · Dock 左侧 · Finder 列表 · Rosetta · 一个空格密码 · 自动登录")
+                                    .text_size(px(11.0))
+                                    .text_color(move || theme().muted_foreground),
+                            )
+                            .child(action_button("一键设置全部", true, move || run_all())),
+                    )
+                    .child(separator())
                     .child(system_action_row(
                         "桌面四角",
                         move || state.hot_corners.get(),
@@ -1438,6 +1664,24 @@ fn system_page(state: UiState, actions: &Actions) -> AnyElement {
                         "关闭四角桌面触发",
                         false,
                         move || corners(),
+                    ))
+                    .child(separator())
+                    .child(system_action_row(
+                        "Dock 位置",
+                        move || state.dock_position.get(),
+                        "把 Dock 固定到屏幕左侧，并立即重新载入。",
+                        "移到屏幕左侧",
+                        false,
+                        move || dock_left(),
+                    ))
+                    .child(separator())
+                    .child(system_action_row(
+                        "Finder 列表视图",
+                        move || state.finder_view.get(),
+                        "默认以列表视图打开文件夹，并在浏览时保持列表视图、不分组。",
+                        "设为默认列表视图",
+                        false,
+                        move || finder_list(),
                     ))
                     .child(separator())
                     .child(system_action_row(

@@ -15,12 +15,8 @@ use std::time::Duration;
 const TAB_ALL: usize = 0;
 const TAB_DISPLAY: usize = 1;
 const TAB_SYSTEM: usize = 2;
-const TAB_RUST: usize = 3;
-const TAB_GO: usize = 4;
-const TAB_NODE: usize = 5;
-const TAB_CLOUDFLARE: usize = 6;
-const TAB_FLUTTER: usize = 7;
-const TAB_MONITOR: usize = 8;
+const TAB_AUTO_START: usize = 3;
+const TAB_AUTO_CLEAN: usize = 4;
 
 #[derive(Clone, PartialEq)]
 struct InstallTask {
@@ -72,7 +68,6 @@ struct UiState {
 #[derive(Clone)]
 struct Actions {
     start_all: Rc<dyn Fn()>,
-    install_one: Rc<dyn Fn(usize)>,
     install_display: Rc<dyn Fn()>,
     apply_display: Rc<dyn Fn()>,
     restore_display: Rc<dyn Fn()>,
@@ -646,27 +641,6 @@ fn make_actions(state: UiState) -> Actions {
         });
     });
 
-    let single_state = state;
-    let install_one = Rc::new(move |task: usize| {
-        if single_state.install_running.get() {
-            return;
-        }
-        single_state.install_running.set(true);
-        single_state.install_finished.set(false);
-        single_state.tasks.update(|tasks| {
-            if let Some(view) = tasks.get_mut(task) {
-                view.state = TaskState::Running;
-                view.progress = 0.0;
-                view.detail = "正在快速检测本地安装…".to_string();
-                view.logs.clear();
-            }
-        });
-        let (tx, rx) = mpsc::channel();
-        let helper = installer::find_helper();
-        std::thread::spawn(move || installer::install_single(tx, helper, task));
-        pump_events(single_state, Arc::new(Mutex::new(rx)));
-    });
-
     let display_state = state;
     let install_display = Rc::new(move || {
         if display_state.display_working.get() {
@@ -982,7 +956,6 @@ fn make_actions(state: UiState) -> Actions {
 
     Actions {
         start_all,
-        install_one,
         install_display,
         apply_display,
         restore_display,
@@ -1002,7 +975,7 @@ pub fn App() -> impl IntoElement {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(TAB_ALL)
-        .min(TAB_MONITOR);
+        .min(TAB_AUTO_CLEAN);
     let tab = signal(initial_tab);
     let tasks = signal(initial_tasks());
     let install_running = signal(false);
@@ -1130,42 +1103,8 @@ pub fn App() -> impl IntoElement {
     let pages = dynamic(move || match state_for_pages.tab.get() {
         TAB_DISPLAY => display_page(state_for_pages, &actions_for_pages),
         TAB_SYSTEM => system_page(state_for_pages, &actions_for_pages),
-        TAB_RUST => task_page(
-            state_for_pages,
-            "Rust / rsproxy",
-            "Rust、Cargo 和 rustup 使用 rsproxy 国内镜像。",
-            &[installer::RUST],
-            &actions_for_pages,
-        ),
-        TAB_GO => task_page(
-            state_for_pages,
-            "Go / goproxy.cn",
-            "Go 全局安装，并编译 goproxycn 代理切换工具。",
-            &[installer::GO],
-            &actions_for_pages,
-        ),
-        TAB_NODE => task_page(
-            state_for_pages,
-            "Node.js / npm / Wrangler",
-            "Node 来自 npmmirror；Wrangler 在 Node 完成后自动安装。",
-            &[installer::NODE, installer::WRANGLER],
-            &actions_for_pages,
-        ),
-        TAB_CLOUDFLARE => task_page(
-            state_for_pages,
-            "Cloudflare 工具",
-            "cloudflared 独立下载并校验 SHA-256。",
-            &[installer::CLOUDFLARED],
-            &actions_for_pages,
-        ),
-        TAB_FLUTTER => task_page(
-            state_for_pages,
-            "Flutter Android",
-            "Flutter 与 Dart 使用 flutter-io.cn 国内镜像。",
-            &[installer::FLUTTER],
-            &actions_for_pages,
-        ),
-        TAB_MONITOR => process_page(state_for_pages, process_pages.clone()),
+        TAB_AUTO_START => auto_start_page(state_for_pages, process_pages.clone()),
+        TAB_AUTO_CLEAN => auto_clean_page(state_for_pages, process_pages.clone()),
         _ => all_page(state_for_pages, &actions_for_pages),
     });
 
@@ -1209,15 +1148,11 @@ pub fn App() -> impl IntoElement {
                 .gap_1()
                 .border_b_1()
                 .border_color(move || theme().border)
-                .child(tab_button("一键所有", TAB_ALL, state))
+                .child(tab_button("安装编程工具", TAB_ALL, state))
                 .child(tab_button("显示器", TAB_DISPLAY, state))
                 .child(tab_button("系统设置", TAB_SYSTEM, state))
-                .child(tab_button("Rust", TAB_RUST, state))
-                .child(tab_button("Go", TAB_GO, state))
-                .child(tab_button("Node", TAB_NODE, state))
-                .child(tab_button("Cloudflare", TAB_CLOUDFLARE, state))
-                .child(tab_button("Flutter", TAB_FLUTTER, state))
-                .child(tab_button("监视 / 自动清理", TAB_MONITOR, state)),
+                .child(tab_button("自动启动进程", TAB_AUTO_START, state))
+                .child(tab_button("自动清理", TAB_AUTO_CLEAN, state)),
         )
         .child(pages)
 }
@@ -1234,12 +1169,12 @@ fn all_page(state: UiState, actions: &Actions) -> AnyElement {
         view()
             .gap_2()
             .child(
-                text("一键安装全部")
+                text("安装编程工具")
                     .text_size(px(28.0))
                     .font_weight(FontWeight::BOLD),
             )
             .child(
-                text("先准备显示器原生覆盖，再配置代理、PATH 和镜像，并并行安装开发工具。")
+                text("统一检测所有开发工具；已安装的立即跳过，只并行安装缺失项。")
                     .text_size(px(13.0))
                     .text_color(move || theme().muted_foreground),
             )
@@ -1307,7 +1242,7 @@ fn all_page(state: UiState, actions: &Actions) -> AnyElement {
                                     .bg(move || theme().primary),
                             ),
                     )
-                    .child(action_button("一键开始", true, move || start()))
+                    .child(action_button("检测并安装", true, move || start()))
                     .children(tasks.into_iter().map(progress_row)),
             ),
     )
@@ -1586,123 +1521,12 @@ fn separator() -> View {
     view().w_full().h(px(1.0)).bg(move || theme().border)
 }
 
-fn task_page(
-    state: UiState,
-    title: &'static str,
-    subtitle: &'static str,
-    task_ids: &'static [usize],
-    actions: &Actions,
-) -> AnyElement {
-    let tasks = state.tasks.get();
-    page_shell(
-        view()
-            .gap_2()
-            .child(
-                text(title)
-                    .text_size(px(28.0))
-                    .font_weight(FontWeight::BOLD),
-            )
-            .child(
-                text(subtitle)
-                    .text_size(px(13.0))
-                    .text_color(move || theme().muted_foreground),
-            )
-            .child(
-                card().children(
-                    task_ids
-                        .iter()
-                        .filter_map(|index| tasks.get(*index).cloned())
-                        .map(progress_row),
-                ),
-            )
-            .child(
-                view()
-                    .flex_row()
-                    .flex_wrap()
-                    .gap_2()
-                    .children(task_ids.iter().filter_map(|index| {
-                        let task = tasks.get(*index)?;
-                        let install = actions.install_one.clone();
-                        let task_index = *index;
-                        Some(action_button(
-                            if task.state == TaskState::Success {
-                                "检测安装状态"
-                            } else {
-                                "检测并安装"
-                            },
-                            true,
-                            move || install(task_index),
-                        ))
-                    })),
-            )
-            .children(task_ids.iter().filter_map(|index| {
-                let task = tasks.get(*index)?;
-                if task.logs.is_empty() {
-                    return None;
-                }
-                Some(
-                    card()
-                        .child(
-                            text(format!("{} 日志", task.title))
-                                .text_size(px(13.0))
-                                .font_weight(FontWeight::SEMIBOLD),
-                        )
-                        .child(
-                            text(task.logs.join("\n"))
-                                .font_family("Menlo")
-                                .text_size(px(10.0))
-                                .text_color(move || theme().muted_foreground),
-                        ),
-                )
-            })),
-    )
-}
-
-fn process_page(_state: UiState, ui: ProcessUi) -> AnyElement {
+fn auto_start_page(_state: UiState, ui: ProcessUi) -> AnyElement {
     let snapshots = ui.snapshots.get();
     let monitors = ui.monitors.get();
-    let processes = ui.processes.get();
-    let rules = ui.kill_rules.get();
-    let filtered = processes::filter_processes(&processes, &ui.query.get());
-    let selected = ui.selected_pids.get();
     let enabled = ui.monitor_enabled.get();
-    let remove_startup = ui.rule_startup.get();
-    let edit_index = ui.editing_rule.get();
-
-    let refresh_ui = ui.clone();
-    let toggle_monitor_ui = ui.clone();
-    let add_monitor_ui = ui.clone();
-    let add_selected_ui = ui.clone();
-    let save_rule_ui = ui.clone();
-    let new_rule_ui = ui.clone();
-    let enforce_ui = ui.clone();
-
-    let monitor_snapshots = snapshots.into_iter().map(|snapshot| {
-        muted_card()
-            .child(
-                view()
-                    .flex_row()
-                    .justify_between()
-                    .child(
-                        text(snapshot.display_name)
-                            .text_size(px(13.0))
-                            .font_weight(FontWeight::SEMIBOLD),
-                    )
-                    .child(
-                        text(snapshot.status)
-                            .text_size(px(12.0))
-                            .text_color(move || theme().muted_foreground),
-                    ),
-            )
-            .child(
-                text(format!(
-                    "{} · 自动重启 {} 次",
-                    snapshot.message, snapshot.restarts
-                ))
-                .text_size(px(11.0))
-                .text_color(move || theme().muted_foreground),
-            )
-    });
+    let toggle_ui = ui.clone();
+    let add_ui = ui.clone();
 
     let monitor_rows = monitors.into_iter().map(|monitor| {
         let remove_ui = ui.clone();
@@ -1737,6 +1561,119 @@ fn process_page(_state: UiState, ui: ProcessUi) -> AnyElement {
                 })),
         )
     });
+
+    let snapshot_rows = snapshots.into_iter().map(|snapshot| {
+        muted_card()
+            .child(
+                view()
+                    .flex_row()
+                    .justify_between()
+                    .child(
+                        text(snapshot.display_name)
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::SEMIBOLD),
+                    )
+                    .child(
+                        text(snapshot.status)
+                            .text_size(px(12.0))
+                            .text_color(move || theme().muted_foreground),
+                    ),
+            )
+            .child(
+                text(format!(
+                    "{} · 自动启动/重启 {} 次",
+                    snapshot.message, snapshot.restarts
+                ))
+                .text_size(px(11.0))
+                .text_color(move || theme().muted_foreground),
+            )
+    });
+
+    page_shell(
+        view()
+            .gap_2()
+            .child(
+                text("自动启动进程")
+                    .text_size(px(28.0))
+                    .font_weight(FontWeight::BOLD),
+            )
+            .child(
+                text("移植 UU远程监视策略：缺失确认、启动宽限、冷却重启和停止状态恢复")
+                    .text_size(px(13.0))
+                    .text_color(move || theme().muted_foreground),
+            )
+            .child(
+                card()
+                    .child(
+                        view()
+                            .flex_row()
+                            .justify_between()
+                            .items_center()
+                            .child(section_title(
+                                "监视应用",
+                                "默认监视 /Applications/UURemote.app；进程缺失后自动启动。",
+                            ))
+                            .child(action_button(
+                                if enabled {
+                                    "暂停监视"
+                                } else {
+                                    "开启监视"
+                                },
+                                true,
+                                move || {
+                                    if let Ok(mut config) = toggle_ui.config.lock() {
+                                        config.monitoring_enabled = !config.monitoring_enabled;
+                                        let _ = processes::save_config(&config);
+                                    }
+                                    toggle_ui.sync_config_signals();
+                                },
+                            )),
+                    )
+                    .children(monitor_rows)
+                    .child(
+                        view()
+                            .flex_row()
+                            .gap_2()
+                            .child(field("添加监视应用路径", ui.monitor_path))
+                            .child(action_button("添加监视", false, move || {
+                                let path = add_ui.monitor_path.get();
+                                add_ui.status.set(match add_ui.config.lock() {
+                                    Ok(mut config) => {
+                                        match processes::add_monitor(&mut config, &path) {
+                                            Ok(()) => "监视应用已添加。".to_string(),
+                                            Err(error) => error,
+                                        }
+                                    }
+                                    Err(_) => "进程配置锁失败".to_string(),
+                                });
+                                add_ui.sync_config_signals();
+                            })),
+                    ),
+            )
+            .children(snapshot_rows)
+            .child(
+                muted_card().child(
+                    text(move || ui.status.get())
+                        .text_size(px(12.0))
+                        .text_color(move || theme().foreground),
+                ),
+            ),
+    )
+}
+
+fn auto_clean_page(_state: UiState, ui: ProcessUi) -> AnyElement {
+    let processes = ui.processes.get();
+    let rules = ui.kill_rules.get();
+    let filtered = processes::filter_processes(&processes, &ui.query.get());
+    let selected = ui.selected_pids.get();
+    let remove_startup = ui.rule_startup.get();
+    let edit_index = ui.editing_rule.get();
+
+    let refresh_ui = ui.clone();
+    let add_selected_ui = ui.clone();
+    let save_rule_ui = ui.clone();
+    let new_rule_ui = ui.clone();
+    let enforce_ui = ui.clone();
 
     let process_rows = filtered.into_iter().take(80).map(|process| {
         let pid = process.pid;
@@ -1914,62 +1851,14 @@ fn process_page(_state: UiState, ui: ProcessUi) -> AnyElement {
         view()
             .gap_2()
             .child(
-                text("监视 / 自动清理")
+                text("自动清理")
                     .text_size(px(28.0))
                     .font_weight(FontWeight::BOLD),
             )
             .child(
-                text("UU远程监视重启 + 搜索多选进程 + 自动终结规则 + 启动项清理")
+                text("搜索并多选进程，拖动加入自动终结规则，并清理对应启动项")
                     .text_size(px(13.0))
                     .text_color(move || theme().muted_foreground),
-            )
-            .child(
-                card()
-                    .child(
-                        view()
-                            .flex_row()
-                            .justify_between()
-                            .items_center()
-                            .child(section_title(
-                                "应用监视与自动重启",
-                                "缺失连续确认后自动启动；先 TERM，超时再 KILL。",
-                            ))
-                            .child(action_button(
-                                if enabled {
-                                    "暂停监视"
-                                } else {
-                                    "开启监视"
-                                },
-                                true,
-                                move || {
-                                    if let Ok(mut config) = toggle_monitor_ui.config.lock() {
-                                        config.monitoring_enabled = !config.monitoring_enabled;
-                                        let _ = processes::save_config(&config);
-                                    }
-                                    toggle_monitor_ui.sync_config_signals();
-                                },
-                            )),
-                    )
-                    .children(monitor_rows)
-                    .child(
-                        view()
-                            .flex_row()
-                            .gap_2()
-                            .child(field("添加监视应用路径", ui.monitor_path))
-                            .child(action_button("添加监视", false, move || {
-                                let path = add_monitor_ui.monitor_path.get();
-                                if let Ok(mut config) = add_monitor_ui.config.lock() {
-                                    add_monitor_ui.status.set(
-                                        match processes::add_monitor(&mut config, &path) {
-                                            Ok(()) => "监视应用已添加。".to_string(),
-                                            Err(error) => error,
-                                        },
-                                    );
-                                }
-                                add_monitor_ui.sync_config_signals();
-                            })),
-                    )
-                    .children(monitor_snapshots),
             )
             .child(
                 card()

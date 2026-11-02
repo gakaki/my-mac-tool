@@ -5,19 +5,20 @@
 
 ## 功能
 
-- **一键所有**：自动准备显示器原生覆盖，配置 `127.0.0.1:7890`
-  系统代理、终端代理、PATH 和国内镜像，然后并行安装开发工具。
+- **安装编程工具**：自动准备显示器原生覆盖，配置 `127.0.0.1:7890`
+  系统代理、终端代理、PATH 和国内镜像，然后检测并安装编程工具。
 - **显示器**：CS40X 5K 原生覆盖、LoDPI/HiDPI 模式切换、备份与恢复。
 - **系统设置**：代理、PATH、关闭桌面四角、Rosetta、弱密码策略和自动登录。
-- **开发工具**：Rust/rsproxy、Go/goproxy.cn、Node/npmmirror、
-  Wrangler、cloudflared、Flutter/Dart。
-- **监视 / 自动清理**：移植 UU远程监视重启策略，搜索和多选进程，
-  拖动进程行加入自动终结列表，并清理匹配的 LaunchAgent/LaunchDaemon。
+- **编程工具**：在同一页集中展示 Rust/rsproxy、Go/goproxy.cn、
+  Node/npmmirror、Wrangler、cloudflared、Flutter/Dart。
+- **自动启动进程**：移植 UU远程监视重启策略，进程缺失后自动启动。
+- **自动清理**：搜索和多选进程，拖动进程行加入自动终结列表，
+  并清理匹配的 LaunchAgent/LaunchDaemon。
 
 每个开发工具都有独立进度、当前阶段和日志。Rust、Go、Node、
 cloudflared、Flutter 并行安装；Wrangler 在 Node 完成后自动开始。
 所有工具在下载前都会先做本地文件检查；已安装项会立即标记为
-“已安装，跳过下载”。每个工具 Tab 也提供相同的独立检测安装按钮。
+“已安装，跳过下载”，只并行安装缺失项。
 
 ## 构建
 

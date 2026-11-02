@@ -106,49 +106,6 @@ pub fn orchestrate(tx: Sender<Event>, helper: PathBuf) {
     let _ = tx.send(Event::AllDone);
 }
 
-pub fn install_single(tx: Sender<Event>, helper: PathBuf, task: usize) {
-    let result = match task {
-        RUST => install_task(&tx, &helper, RUST, "install rust", "通过 rsproxy 安装 Rust"),
-        GO => install_task(&tx, &helper, GO, "install go", "安装 Go 并编译 goproxycn"),
-        NODE => install_task(
-            &tx,
-            &helper,
-            NODE,
-            "install node",
-            "通过 npmmirror 安装 Node.js",
-        ),
-        WRANGLER => install_task(
-            &tx,
-            &helper,
-            WRANGLER,
-            "install wrangler-only",
-            "通过 npm 淘宝镜像安装 Wrangler",
-        ),
-        CLOUDFLARED => install_task(
-            &tx,
-            &helper,
-            CLOUDFLARED,
-            "install cloudflared",
-            "下载 Cloudflare Tunnel",
-        ),
-        FLUTTER => install_task(
-            &tx,
-            &helper,
-            FLUTTER,
-            "install flutter",
-            "安装 Flutter 与 Dart",
-        ),
-        _ => false,
-    };
-    let state = if result {
-        TaskState::Success
-    } else {
-        TaskState::Failed
-    };
-    send_state(&tx, task, state, if result { "完成" } else { "安装失败" });
-    let _ = tx.send(Event::AllDone);
-}
-
 fn install_task(
     tx: &Sender<Event>,
     helper: &PathBuf,

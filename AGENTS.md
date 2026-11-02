@@ -22,6 +22,7 @@
 - Every tool installer must perform a filesystem-only preflight before any
   network request. One-click installs must preflight components in parallel,
   mark installed tools as skipped, and only download missing components.
-- Individual tool tabs must expose the same fast check-and-install path.
+- Keep every programming tool on the single "安装编程工具" page. Do not add
+  individual tool tabs.
 - Run `cargo test --bins --lib` or the Native Shell equivalent before
   committing.

@@ -10,7 +10,7 @@ fn main() -> impl std::process::Termination {
         platform::AppSource::Rust(platform::Root::of::<mac_settings_ui::App>()),
         platform::AppOptions {
             title: "我的 Mac 设置和开发工具安装".to_owned(),
-            size: (1080, 840),
+            size: (866, 1666),
             ..Default::default()
         },
     )

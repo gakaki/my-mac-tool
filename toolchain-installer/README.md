@@ -54,6 +54,7 @@ cargo build --release
 `~/.local/cache/toolchain-installer`。
 
 安装器会维护 `~/.zshenv` 和 `~/.npmrc` 中的标记配置，不会覆盖其他设置。
+安装前会以毫秒级文件检查并行确认现有组件，已安装工具不会重新下载。
 
 ## Go 代理
 

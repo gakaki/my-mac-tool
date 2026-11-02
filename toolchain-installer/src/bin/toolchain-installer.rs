@@ -83,6 +83,8 @@ fn entrypoint() -> Result<()> {
             Ok(())
         }
         [command] if command == "doctor" => doctor(),
+        [command] if command == "status" => fast_status(),
+        [command, name] if command == "check" => fast_check(name),
         [command] if command == "configure" => configure_only(),
         [command] if command == "setup" => setup_environment(),
         [command, rest @ ..] if command == "install" => {
@@ -111,6 +113,8 @@ Usage:
   toolchain-installer configure
   toolchain-installer setup
   toolchain-installer doctor
+  toolchain-installer status
+  toolchain-installer check rust|go|node|wrangler|cloudflared|flutter
 
 Mirrors:
   Rust     https://rsproxy.cn
@@ -226,6 +230,10 @@ fn setup_environment() -> Result<()> {
 }
 
 fn install_rust(layout: &Layout) -> Result<()> {
+    if component_installed(layout, Component::Rust) {
+        println!("==> Rust already installed; skipping.");
+        return Ok(());
+    }
     println!("\n==> Rust via rsproxy");
     let kind = "rustup";
     let root = layout.tools.join(kind);
@@ -265,6 +273,10 @@ fn install_rust(layout: &Layout) -> Result<()> {
 }
 
 fn install_go(layout: &Layout) -> Result<()> {
+    if component_installed(layout, Component::Go) {
+        println!("==> Go and goproxycn already installed; skipping.");
+        return Ok(());
+    }
     println!("\n==> Go via golang.google.cn + goproxy.cn");
     let json = curl_text(GO_DOWNLOAD_JSON)?;
     let version = jq(&json, ".[0].version")?;
@@ -300,6 +312,10 @@ fn install_go(layout: &Layout) -> Result<()> {
 }
 
 fn install_node(layout: &Layout) -> Result<()> {
+    if component_installed(layout, Component::Node) {
+        println!("==> Node.js and npm already installed; skipping.");
+        return Ok(());
+    }
     println!("\n==> Node.js via npmmirror");
     let json = curl_text(NODE_INDEX)?;
     let suffix = match arch_name()?.as_str() {
@@ -347,6 +363,10 @@ fn install_node(layout: &Layout) -> Result<()> {
 }
 
 fn install_wrangler(layout: &Layout) -> Result<()> {
+    if component_installed(layout, Component::Wrangler) {
+        println!("==> Wrangler already installed; skipping.");
+        return Ok(());
+    }
     println!("\n==> Wrangler via npm mirror");
     let node = find_command(layout, "node")?;
     let npm = find_command(layout, "npm")?;
@@ -370,6 +390,10 @@ fn install_wrangler(layout: &Layout) -> Result<()> {
 }
 
 fn install_cloudflared(layout: &Layout) -> Result<()> {
+    if component_installed(layout, Component::Cloudflared) {
+        println!("==> cloudflared already installed; skipping.");
+        return Ok(());
+    }
     println!("\n==> cloudflared");
     let json = curl_text("https://api.github.com/repos/cloudflare/cloudflared/releases/latest")?;
     let asset = if arch_name()? == "aarch64" {
@@ -404,6 +428,10 @@ fn install_cloudflared(layout: &Layout) -> Result<()> {
 }
 
 fn install_flutter(layout: &Layout) -> Result<()> {
+    if component_installed(layout, Component::Flutter) {
+        println!("==> Flutter and Dart already installed; skipping.");
+        return Ok(());
+    }
     println!("\n==> Flutter stable via flutter-io.cn");
     let json = curl_text(FLUTTER_RELEASES)?;
     let arch_filter = if arch_name()? == "aarch64" {
@@ -710,6 +738,78 @@ fn doctor() -> Result<()> {
     println!("  Go    {GOPROXY}");
     println!("  npm   {NPM_REGISTRY}");
     println!("  Flutter {FLUTTER_STORAGE}");
+    Ok(())
+}
+
+impl Component {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::Go => "go",
+            Self::Node => "node",
+            Self::Wrangler => "wrangler",
+            Self::Cloudflared => "cloudflared",
+            Self::Flutter => "flutter",
+        }
+    }
+
+    fn parse_exact(value: &str) -> Result<Self> {
+        match value {
+            "rust" | "rsproxy" => Ok(Self::Rust),
+            "go" | "goproxycn" => Ok(Self::Go),
+            "node" | "nodejs" => Ok(Self::Node),
+            "wrangler" => Ok(Self::Wrangler),
+            "cloudflared" => Ok(Self::Cloudflared),
+            "flutter" | "android" => Ok(Self::Flutter),
+            other => Err(format!("unknown component: {other}")),
+        }
+    }
+}
+
+fn component_installed(layout: &Layout, component: Component) -> bool {
+    let required: &[&str] = match component {
+        Component::Rust => &["cargo", "rustc", "rustup"],
+        Component::Go => &["go", "gofmt", "goproxycn"],
+        Component::Node => &["node", "npm", "npx"],
+        Component::Wrangler => &["wrangler"],
+        Component::Cloudflared => &["cloudflared"],
+        Component::Flutter => &["flutter", "dart"],
+    };
+    required.iter().all(|name| layout.bin.join(name).exists())
+}
+
+fn fast_check(name: &str) -> Result<()> {
+    let layout = Layout::detect()?;
+    let component = Component::parse_exact(name)?;
+    if component_installed(&layout, component) {
+        println!("{}: installed", component.key());
+        Ok(())
+    } else {
+        Err(format!("{}: not installed", component.key()))
+    }
+}
+
+fn fast_status() -> Result<()> {
+    let layout = Layout::detect()?;
+    let statuses = [
+        Component::Rust,
+        Component::Go,
+        Component::Node,
+        Component::Wrangler,
+        Component::Cloudflared,
+        Component::Flutter,
+    ]
+    .into_iter()
+    .map(|component| {
+        format!(
+            "\"{}\":{}",
+            component.key(),
+            component_installed(&layout, component)
+        )
+    })
+    .collect::<Vec<_>>()
+    .join(",");
+    println!("{{{statuses}}}");
     Ok(())
 }
 

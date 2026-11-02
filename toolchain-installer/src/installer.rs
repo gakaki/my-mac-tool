@@ -77,14 +77,14 @@ pub fn orchestrate(tx: Sender<Event>, helper: PathBuf) {
         let tx = tx.clone();
         let helper = helper.clone();
         workers.push(thread::spawn(move || {
-            run_task(&tx, &helper, task, command, detail)
+            install_task(&tx, &helper, task, command, detail)
         }));
     }
 
     let node_handle = workers.remove(2);
     let node_ok = node_handle.join().unwrap_or(false);
     if node_ok {
-        run_task(
+        install_task(
             &tx,
             &helper,
             WRANGLER,
@@ -104,6 +104,86 @@ pub fn orchestrate(tx: Sender<Event>, helper: PathBuf) {
         let _ = worker.join();
     }
     let _ = tx.send(Event::AllDone);
+}
+
+pub fn install_single(tx: Sender<Event>, helper: PathBuf, task: usize) {
+    let result = match task {
+        RUST => install_task(&tx, &helper, RUST, "install rust", "通过 rsproxy 安装 Rust"),
+        GO => install_task(&tx, &helper, GO, "install go", "安装 Go 并编译 goproxycn"),
+        NODE => install_task(
+            &tx,
+            &helper,
+            NODE,
+            "install node",
+            "通过 npmmirror 安装 Node.js",
+        ),
+        WRANGLER => install_task(
+            &tx,
+            &helper,
+            WRANGLER,
+            "install wrangler-only",
+            "通过 npm 淘宝镜像安装 Wrangler",
+        ),
+        CLOUDFLARED => install_task(
+            &tx,
+            &helper,
+            CLOUDFLARED,
+            "install cloudflared",
+            "下载 Cloudflare Tunnel",
+        ),
+        FLUTTER => install_task(
+            &tx,
+            &helper,
+            FLUTTER,
+            "install flutter",
+            "安装 Flutter 与 Dart",
+        ),
+        _ => false,
+    };
+    let state = if result {
+        TaskState::Success
+    } else {
+        TaskState::Failed
+    };
+    send_state(&tx, task, state, if result { "完成" } else { "安装失败" });
+    let _ = tx.send(Event::AllDone);
+}
+
+fn install_task(
+    tx: &Sender<Event>,
+    helper: &PathBuf,
+    task: usize,
+    arguments: &str,
+    detail: &str,
+) -> bool {
+    let component = match task {
+        RUST => "rust",
+        GO => "go",
+        NODE => "node",
+        WRANGLER => "wrangler",
+        CLOUDFLARED => "cloudflared",
+        FLUTTER => "flutter",
+        _ => return false,
+    };
+    send_state(tx, task, TaskState::Running, "正在快速检测本地安装…");
+    let check = Command::new(helper)
+        .args(["check", component])
+        .env("PATH", gui_path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if check {
+        let _ = tx.send(Event::Progress {
+            task,
+            progress: 100.0,
+            detail: "已安装，跳过下载".to_string(),
+        });
+        send_state(tx, task, TaskState::Success, "已安装，跳过下载");
+        return true;
+    }
+    run_task(tx, helper, task, arguments, detail)
 }
 
 fn run_task(
@@ -283,7 +363,7 @@ pub fn find_helper() -> PathBuf {
     })
 }
 
-fn gui_path() -> String {
+pub(crate) fn gui_path() -> String {
     let home = env::var("HOME").unwrap_or_default();
     format!(
         "{home}/.local/bin:{home}/.local/share/toolchains/rustup/cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"

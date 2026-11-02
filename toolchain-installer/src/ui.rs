@@ -6,6 +6,7 @@ use nsh_base::theme;
 use nsh_core::element::input;
 use nsh_core::prelude::*;
 use std::env;
+use std::process::Command;
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -71,6 +72,7 @@ struct UiState {
 #[derive(Clone)]
 struct Actions {
     start_all: Rc<dyn Fn()>,
+    install_one: Rc<dyn Fn(usize)>,
     install_display: Rc<dyn Fn()>,
     apply_display: Rc<dyn Fn()>,
     restore_display: Rc<dyn Fn()>,
@@ -516,6 +518,50 @@ fn start_developer_installers(state: UiState) {
     pump_events(state, rx);
 }
 
+fn preflight_installed_tasks(state: UiState) {
+    spawn(async move {
+        let helper = installer::find_helper();
+        let output = blocking(move || {
+            Command::new(helper)
+                .arg("status")
+                .env("PATH", installer::gui_path())
+                .output()
+        })
+        .await;
+        let Ok(Ok(output)) = output else {
+            return;
+        };
+        if !output.status.success() {
+            return;
+        }
+        let Ok(status) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+            return;
+        };
+        let mapping = [
+            (installer::RUST, "rust"),
+            (installer::GO, "go"),
+            (installer::NODE, "node"),
+            (installer::WRANGLER, "wrangler"),
+            (installer::CLOUDFLARED, "cloudflared"),
+            (installer::FLUTTER, "flutter"),
+        ];
+        state.tasks.update(|tasks| {
+            for (task, key) in mapping {
+                if status
+                    .get(key)
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                    && let Some(view) = tasks.get_mut(task)
+                {
+                    view.state = TaskState::Success;
+                    view.progress = 100.0;
+                    view.detail = "检测到已安装，跳过下载".to_string();
+                }
+            }
+        });
+    });
+}
+
 fn target_from_state(state: UiState) -> Result<TargetMode, String> {
     Ok(TargetMode {
         width: parse_u32(&state.target_width.get(), "物理宽度")?,
@@ -598,6 +644,27 @@ fn make_actions(state: UiState) -> Actions {
             install_display_for_state(start_state).await;
             start_developer_installers(start_state);
         });
+    });
+
+    let single_state = state;
+    let install_one = Rc::new(move |task: usize| {
+        if single_state.install_running.get() {
+            return;
+        }
+        single_state.install_running.set(true);
+        single_state.install_finished.set(false);
+        single_state.tasks.update(|tasks| {
+            if let Some(view) = tasks.get_mut(task) {
+                view.state = TaskState::Running;
+                view.progress = 0.0;
+                view.detail = "正在快速检测本地安装…".to_string();
+                view.logs.clear();
+            }
+        });
+        let (tx, rx) = mpsc::channel();
+        let helper = installer::find_helper();
+        std::thread::spawn(move || installer::install_single(tx, helper, task));
+        pump_events(single_state, Arc::new(Mutex::new(rx)));
     });
 
     let display_state = state;
@@ -915,6 +982,7 @@ fn make_actions(state: UiState) -> Actions {
 
     Actions {
         start_all,
+        install_one,
         install_display,
         apply_display,
         restore_display,
@@ -983,6 +1051,7 @@ pub fn App() -> impl IntoElement {
         helper_working,
     };
     let actions = make_actions(state);
+    preflight_installed_tasks(state);
     let process_ui = ProcessUi::new();
     process_ui.start_monitor();
 
@@ -1066,30 +1135,35 @@ pub fn App() -> impl IntoElement {
             "Rust / rsproxy",
             "Rust、Cargo 和 rustup 使用 rsproxy 国内镜像。",
             &[installer::RUST],
+            &actions_for_pages,
         ),
         TAB_GO => task_page(
             state_for_pages,
             "Go / goproxy.cn",
             "Go 全局安装，并编译 goproxycn 代理切换工具。",
             &[installer::GO],
+            &actions_for_pages,
         ),
         TAB_NODE => task_page(
             state_for_pages,
             "Node.js / npm / Wrangler",
             "Node 来自 npmmirror；Wrangler 在 Node 完成后自动安装。",
             &[installer::NODE, installer::WRANGLER],
+            &actions_for_pages,
         ),
         TAB_CLOUDFLARE => task_page(
             state_for_pages,
             "Cloudflare 工具",
             "cloudflared 独立下载并校验 SHA-256。",
             &[installer::CLOUDFLARED],
+            &actions_for_pages,
         ),
         TAB_FLUTTER => task_page(
             state_for_pages,
             "Flutter Android",
             "Flutter 与 Dart 使用 flutter-io.cn 国内镜像。",
             &[installer::FLUTTER],
+            &actions_for_pages,
         ),
         TAB_MONITOR => process_page(state_for_pages, process_pages.clone()),
         _ => all_page(state_for_pages, &actions_for_pages),
@@ -1517,6 +1591,7 @@ fn task_page(
     title: &'static str,
     subtitle: &'static str,
     task_ids: &'static [usize],
+    actions: &Actions,
 ) -> AnyElement {
     let tasks = state.tasks.get();
     page_shell(
@@ -1539,6 +1614,26 @@ fn task_page(
                         .filter_map(|index| tasks.get(*index).cloned())
                         .map(progress_row),
                 ),
+            )
+            .child(
+                view()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap_2()
+                    .children(task_ids.iter().filter_map(|index| {
+                        let task = tasks.get(*index)?;
+                        let install = actions.install_one.clone();
+                        let task_index = *index;
+                        Some(action_button(
+                            if task.state == TaskState::Success {
+                                "检测安装状态"
+                            } else {
+                                "检测并安装"
+                            },
+                            true,
+                            move || install(task_index),
+                        ))
+                    })),
             )
             .children(task_ids.iter().filter_map(|index| {
                 let task = tasks.get(*index)?;

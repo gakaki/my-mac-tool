@@ -34,6 +34,23 @@ cargo test --lib
 open "dist/我的 Mac 设置和开发工具安装.app"
 ```
 
+生成可分发 DMG（会一并生成 SHA-256 校验文件）：
+
+```sh
+./packaging/package_dmg.sh 1.0.0
+```
+
+GitHub Actions 在推送 `v*` 标签时自动运行测试、构建 DMG，并上传到同名
+Release：
+
+```sh
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+当前安装包使用 ad-hoc 签名，未做 Apple 公证。首次打开若被 Gatekeeper
+阻止，请在 Finder 中右键应用并选择“打开”。
+
 后台 `toolchain-installer` 二进制仅用于安装引擎，不提供第二个 GUI。
 
 ## 进程规则

@@ -2,6 +2,7 @@
 set -euo pipefail
 
 project_dir="$(cd "$(dirname "$0")/.." && pwd)"
+app_version="${1:-${APP_VERSION:-1.0.0}}"
 xcode_sdk="/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
 xcode_linker="/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang"
 
@@ -21,6 +22,8 @@ mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources"
 cp "$project_dir/target/release/my-mac-installer" "$app_dir/Contents/MacOS/my-mac-installer"
 cp "$project_dir/target/release/toolchain-installer" "$app_dir/Contents/MacOS/toolchain-installer"
 cp "$project_dir/packaging/Info.plist" "$app_dir/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $app_version" "$app_dir/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $app_version" "$app_dir/Contents/Info.plist"
 
 icon_work="$(mktemp -d)"
 trap 'rm -rf "$icon_work"' EXIT

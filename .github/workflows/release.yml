@@ -1,0 +1,70 @@
+name: Build and Release DMG
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-15
+    env:
+      CARGO_TERM_COLOR: always
+      RELEASE_TAG: ${{ github.ref_name }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: toolchain-installer -> target
+
+      - name: Run tests
+        working-directory: toolchain-installer
+        run: cargo test --bins --lib
+
+      - name: Build app and DMG
+        working-directory: toolchain-installer
+        run: |
+          chmod +x packaging/package_app.sh packaging/package_dmg.sh
+          ./packaging/package_dmg.sh "${RELEASE_TAG#v}"
+
+      - name: Verify DMG contents
+        working-directory: toolchain-installer
+        run: |
+          dmg_path="$(find dist -maxdepth 1 -name '*.dmg' -print -quit)"
+          test -n "$dmg_path"
+          hdiutil verify "$dmg_path"
+          mount_dir="$RUNNER_TEMP/my-mac-tool-dmg"
+          mkdir -p "$mount_dir"
+          hdiutil attach "$dmg_path" -mountpoint "$mount_dir" -nobrowse
+          test -d "$mount_dir/我的 Mac 设置和开发工具安装.app"
+          test -L "$mount_dir/Applications"
+          hdiutil detach "$mount_dir"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            macOS 安装包使用 ad-hoc 签名，未做 Apple 公证。
+            首次打开若被 Gatekeeper 阻止，请在 Finder 中右键应用并选择“打开”。
+            下载后可用同目录的 `.sha256` 文件校验安装包。
+          files: |
+            toolchain-installer/dist/*.dmg
+            toolchain-installer/dist/*.sha256

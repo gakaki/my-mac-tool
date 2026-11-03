@@ -11,6 +11,15 @@
 open "dist/我的 Mac 设置和开发工具安装.app"
 ```
 
+生成 DMG 和 SHA-256：
+
+```sh
+./packaging/package_dmg.sh 1.0.0
+```
+
+推送 `v*` 标签会触发 GitHub Actions，自动测试、构建 DMG 并发布到
+对应的 GitHub Release。
+
 GUI 首页是“安装编程工具”。按下“检测并安装”后先配置
 `127.0.0.1:7890` 系统代理、终端代理、PATH 和镜像，再并行安装各组件。
 Rust、Go、Node、cloudflared 和 Flutter 会同时下载；Wrangler 在 Node

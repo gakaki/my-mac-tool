@@ -1,3 +1,4 @@
+use crate::btm;
 use crate::privileged::{run as run_privileged, shell_quote};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -7,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
+
+pub const MONITOR_CHECK_INTERVAL_SECONDS: u64 = 5;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct MonitorApp {
@@ -45,7 +48,7 @@ impl Default for ProcessConfig {
     fn default() -> Self {
         Self {
             monitoring_enabled: true,
-            check_interval_seconds: 5,
+            check_interval_seconds: MONITOR_CHECK_INTERVAL_SECONDS,
             launch_grace_seconds: 25,
             missing_confirmations: 2,
             hang_confirmations: 3,
@@ -101,7 +104,9 @@ pub struct MonitorSnapshot {
 struct AppRuntime {
     missing_checks: u32,
     stopped_checks: u32,
-    last_restart: Option<Instant>,
+    last_auto_action: Option<Instant>,
+    launch_grace_until: Option<Instant>,
+    pending_restart: bool,
     restarts: u32,
 }
 
@@ -158,20 +163,6 @@ fn run_launchctl(arguments: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn parse_background_item_disposition(output: &str, identifier: &str) -> (bool, Option<bool>) {
-    let Some(block) = output
-        .split("\n\n")
-        .find(|block| block.contains(&format!("Identifier: 8.{identifier}")))
-    else {
-        return (false, None);
-    };
-    let disposition = block
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("Disposition:"));
-    let enabled = disposition.map(|value| !value.contains("disabled"));
-    (true, enabled)
-}
-
 pub fn inspect_uu_remote_login_item() -> Result<UuRemoteLoginStatus, String> {
     let app_installed = Path::new(UU_REMOTE_APP_PATH).is_dir();
     let bundled_agent_available = Path::new(UU_REMOTE_AGENT_SOURCE).is_file();
@@ -189,15 +180,9 @@ pub fn inspect_uu_remote_login_item() -> Result<UuRemoteLoginStatus, String> {
     let launchd_enabled = !disabled_output
         .lines()
         .any(|line| line.contains(UU_REMOTE_LOGIN_LABEL) && line.contains("=> disabled"));
-    let btm_output = Command::new("/usr/bin/sfltool")
-        .arg("dumpbtm")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        .unwrap_or_default();
-    let (background_item_registered, background_item_enabled) =
-        parse_background_item_disposition(&btm_output, UU_REMOTE_LOGIN_LABEL);
+    let background_item_enabled =
+        btm::enabled_for_identifier(&format!("8.{UU_REMOTE_LOGIN_LABEL}")).unwrap_or(None);
+    let background_item_registered = background_item_enabled.is_some();
     Ok(UuRemoteLoginStatus {
         app_installed,
         bundled_agent_available,
@@ -465,6 +450,7 @@ pub fn add_monitor(config: &mut ProcessConfig, app_path: &str) -> Result<(), Str
         .and_then(|value| value.to_str())
         .unwrap_or("未命名应用")
         .to_string();
+    let executable_name = bundle_executable_name(path).unwrap_or_else(|| display_name.clone());
     let app_path = path
         .canonicalize()
         .map_err(|error| format!("无法解析应用路径：{error}"))?
@@ -477,7 +463,7 @@ pub fn add_monitor(config: &mut ProcessConfig, app_path: &str) -> Result<(), Str
     {
         config.monitors.push(MonitorApp {
             display_name: display_name.clone(),
-            executable_name: display_name,
+            executable_name,
             app_path,
             enabled: true,
         });
@@ -489,117 +475,216 @@ pub fn monitor_tick(config: &ProcessConfig, runtime: &mut MonitorRuntime) -> Vec
     if !config.monitoring_enabled {
         return Vec::new();
     }
-    let processes = list_processes().unwrap_or_default();
-    let now = Instant::now();
+    let processes = match list_processes() {
+        Ok(processes) => processes,
+        Err(error) => {
+            return config
+                .monitors
+                .iter()
+                .filter(|app| app.enabled)
+                .map(|app| MonitorSnapshot {
+                    app_path: app.app_path.clone(),
+                    display_name: app.display_name.clone(),
+                    status: "检测失败".to_string(),
+                    pid: None,
+                    message: format!("无法确认主进程状态，未执行任何自动操作：{error}"),
+                    restarts: 0,
+                })
+                .collect();
+        }
+    };
+    monitor_tick_with_processes(config, runtime, &processes, Instant::now(), launch_app)
+}
+
+fn monitor_tick_with_processes<F>(
+    config: &ProcessConfig,
+    runtime: &mut MonitorRuntime,
+    processes: &[ProcessInfo],
+    now: Instant,
+    mut launch: F,
+) -> Vec<MonitorSnapshot>
+where
+    F: FnMut(&str) -> Result<(), String>,
+{
     let mut snapshots = Vec::new();
     for app in config.monitors.iter().filter(|app| app.enabled) {
-        let found = find_app_process(app, &processes);
+        let found = find_app_process(app, processes);
         let state = runtime.apps.entry(app.app_path.clone()).or_default();
         if let Some(process) = found {
             state.missing_checks = 0;
+            if state.pending_restart {
+                state.pending_restart = false;
+                state.restarts += 1;
+            }
+            let in_launch_grace = state.launch_grace_until.is_some_and(|until| now < until);
+            if state.launch_grace_until.is_some_and(|until| now >= until) {
+                state.launch_grace_until = None;
+            }
             let stopped = process.stat.contains('T');
             if stopped {
                 state.stopped_checks += 1;
             } else {
                 state.stopped_checks = 0;
             }
-            let cooldown_ready = state.last_restart.is_none_or(|last| {
-                now.duration_since(last).as_secs() >= config.restart_cooldown_seconds
-            });
-            if stopped && state.stopped_checks >= config.hang_confirmations.max(1) && cooldown_ready
+            let cooldown = cooldown_remaining(state, config, now);
+            if stopped
+                && state.stopped_checks >= config.hang_confirmations.max(1)
+                && cooldown.is_none()
             {
                 let restart_result = terminate_pid(process.pid, config.terminate_timeout_seconds)
-                    .and_then(|_| launch_app(&app.app_path));
+                    .and_then(|_| launch(&app.app_path));
                 state.stopped_checks = 0;
-                state.last_restart = Some(now);
+                state.last_auto_action = Some(now);
                 match restart_result {
                     Ok(()) => {
-                        state.restarts += 1;
-                        snapshots.push(MonitorSnapshot {
-                            app_path: app.app_path.clone(),
-                            display_name: app.display_name.clone(),
-                            status: "正在自动重启".to_string(),
-                            pid: None,
-                            message: format!("进程 {} 已停止，已自动重启", process.pid),
-                            restarts: state.restarts,
-                        });
+                        state.pending_restart = true;
+                        state.launch_grace_until =
+                            Some(now + Duration::from_secs(config.launch_grace_seconds.max(1)));
+                        snapshots.push(monitor_snapshot(
+                            app,
+                            state,
+                            "正在自动重启",
+                            None,
+                            "已终止停止的主进程并发送重启命令".to_string(),
+                        ));
                     }
-                    Err(error) => snapshots.push(MonitorSnapshot {
-                        app_path: app.app_path.clone(),
-                        display_name: app.display_name.clone(),
-                        status: "重启失败".to_string(),
-                        pid: Some(process.pid),
-                        message: error,
-                        restarts: state.restarts,
-                    }),
+                    Err(error) => {
+                        state.pending_restart = false;
+                        state.launch_grace_until = None;
+                        snapshots.push(monitor_snapshot(
+                            app,
+                            state,
+                            "重启失败",
+                            Some(process.pid),
+                            error,
+                        ));
+                    }
                 }
                 continue;
             }
-            snapshots.push(MonitorSnapshot {
-                app_path: app.app_path.clone(),
-                display_name: app.display_name.clone(),
-                status: if stopped {
-                    "进程已停止"
+            if stopped {
+                let message = if let Some(remaining) = cooldown {
+                    format!("主进程已停止；等待自动操作冷却结束（剩余 {remaining} 秒）")
                 } else {
-                    "运行中"
-                }
-                .to_string(),
-                pid: Some(process.pid),
-                message: format!("PID {} · {}% CPU", process.pid, process.cpu),
-                restarts: state.restarts,
-            });
+                    format!(
+                        "无响应确认 {}/{}",
+                        state.stopped_checks,
+                        config.hang_confirmations.max(1)
+                    )
+                };
+                snapshots.push(monitor_snapshot(
+                    app,
+                    state,
+                    "进程已停止",
+                    Some(process.pid),
+                    message,
+                ));
+            } else if in_launch_grace {
+                snapshots.push(monitor_snapshot(
+                    app,
+                    state,
+                    "正在启动",
+                    Some(process.pid),
+                    "应用处于启动宽限期".to_string(),
+                ));
+            } else {
+                snapshots.push(monitor_snapshot(
+                    app,
+                    state,
+                    "运行正常",
+                    Some(process.pid),
+                    format!("主进程响应正常 · {}% CPU", process.cpu),
+                ));
+            }
             continue;
         }
-        state.missing_checks += 1;
         state.stopped_checks = 0;
-        let cooldown_ready = state.last_restart.is_none_or(|last| {
-            now.duration_since(last).as_secs() >= config.restart_cooldown_seconds
-        });
-        if state.missing_checks >= config.missing_confirmations && cooldown_ready {
-            match launch_app(&app.app_path) {
-                Ok(()) => {
-                    state.missing_checks = 0;
-                    state.last_restart = Some(now);
-                    state.restarts += 1;
-                    snapshots.push(MonitorSnapshot {
-                        app_path: app.app_path.clone(),
-                        display_name: app.display_name.clone(),
-                        status: "正在自动启动".to_string(),
-                        pid: None,
-                        message: "已发送启动命令，等待进程出现".to_string(),
-                        restarts: state.restarts,
-                    });
-                }
-                Err(error) => snapshots.push(MonitorSnapshot {
-                    app_path: app.app_path.clone(),
-                    display_name: app.display_name.clone(),
-                    status: "启动失败".to_string(),
-                    pid: None,
-                    message: error,
-                    restarts: state.restarts,
-                }),
-            }
-        } else {
-            snapshots.push(MonitorSnapshot {
-                app_path: app.app_path.clone(),
-                display_name: app.display_name.clone(),
-                status: "进程缺失".to_string(),
-                pid: None,
-                message: format!(
-                    "确认中 {}/{}；{}",
+        if state.launch_grace_until.is_some_and(|until| now < until) {
+            snapshots.push(monitor_snapshot(
+                app,
+                state,
+                "正在启动",
+                None,
+                format!("启动命令已发送 · 每 {MONITOR_CHECK_INTERVAL_SECONDS} 秒复检主进程"),
+            ));
+            continue;
+        }
+        if state.launch_grace_until.is_some_and(|until| now >= until) {
+            state.launch_grace_until = None;
+            state.pending_restart = false;
+        }
+        state.missing_checks = state.missing_checks.saturating_add(1);
+        if let Some(remaining) = cooldown_remaining(state, config, now) {
+            snapshots.push(monitor_snapshot(
+                app,
+                state,
+                "应用未运行",
+                None,
+                format!("主进程已退出 · 等待自动操作冷却结束（剩余 {remaining} 秒）"),
+            ));
+            continue;
+        }
+        if state.missing_checks < config.missing_confirmations.max(1) {
+            snapshots.push(monitor_snapshot(
+                app,
+                state,
+                "应用未运行",
+                None,
+                format!(
+                    "主进程已退出 · 确认中 {}/{}",
                     state.missing_checks,
-                    config.missing_confirmations,
-                    if cooldown_ready {
-                        "等待自动启动"
-                    } else {
-                        "冷却中"
-                    }
+                    config.missing_confirmations.max(1)
                 ),
-                restarts: state.restarts,
-            });
+            ));
+            continue;
+        }
+        match launch(&app.app_path) {
+            Ok(()) => {
+                state.missing_checks = 0;
+                state.last_auto_action = Some(now);
+                state.launch_grace_until =
+                    Some(now + Duration::from_secs(config.launch_grace_seconds.max(1)));
+                state.pending_restart = true;
+                snapshots.push(monitor_snapshot(
+                    app,
+                    state,
+                    "正在自动启动",
+                    None,
+                    format!("启动命令已发送 · 每 {MONITOR_CHECK_INTERVAL_SECONDS} 秒复检主进程"),
+                ));
+            }
+            Err(error) => {
+                state.last_auto_action = Some(now);
+                state.launch_grace_until = None;
+                state.pending_restart = false;
+                snapshots.push(monitor_snapshot(app, state, "启动失败", None, error));
+            }
         }
     }
     snapshots
+}
+
+fn monitor_snapshot(
+    app: &MonitorApp,
+    state: &AppRuntime,
+    status: &str,
+    pid: Option<u32>,
+    message: String,
+) -> MonitorSnapshot {
+    MonitorSnapshot {
+        app_path: app.app_path.clone(),
+        display_name: app.display_name.clone(),
+        status: status.to_string(),
+        pid,
+        message,
+        restarts: state.restarts,
+    }
+}
+
+fn cooldown_remaining(state: &AppRuntime, config: &ProcessConfig, now: Instant) -> Option<u64> {
+    let last = state.last_auto_action?;
+    let elapsed = now.saturating_duration_since(last).as_secs();
+    (elapsed < config.restart_cooldown_seconds).then_some(config.restart_cooldown_seconds - elapsed)
 }
 
 pub fn terminate_pid(pid: u32, timeout_seconds: u64) -> Result<(), String> {
@@ -634,13 +719,48 @@ pub fn terminate_pid(pid: u32, timeout_seconds: u64) -> Result<(), String> {
 }
 
 fn find_app_process<'a>(app: &MonitorApp, processes: &'a [ProcessInfo]) -> Option<&'a ProcessInfo> {
+    let executable = expected_app_executable(app);
     processes.iter().find(|process| {
-        process.executable_path == app.executable_name
-            || process.name == app.executable_name
-            || process
-                .executable_path
-                .starts_with(&format!("{}/Contents/MacOS/", app.app_path))
+        !process_has_exited(process) && Path::new(&process.executable_path) == executable.as_path()
     })
+}
+
+fn expected_app_executable(app: &MonitorApp) -> PathBuf {
+    let executable = app.executable_name.trim();
+    let path = Path::new(executable);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        Path::new(&app.app_path)
+            .join("Contents/MacOS")
+            .join(executable)
+    }
+}
+
+fn process_has_exited(process: &ProcessInfo) -> bool {
+    process
+        .stat
+        .chars()
+        .next()
+        .is_some_and(|state| matches!(state, 'Z' | 'X' | 'x'))
+}
+
+fn bundle_executable_name(app_path: &Path) -> Option<String> {
+    let info_plist = app_path.join("Contents/Info.plist");
+    if !info_plist.is_file() {
+        return None;
+    }
+    let output = Command::new("/usr/bin/plutil")
+        .args(["-extract", "CFBundleExecutable", "raw", "-o", "-"])
+        .arg(&info_plist)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let executable = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!executable.is_empty() && !executable.contains('/') && !executable.contains('\0'))
+        .then_some(executable)
 }
 
 fn default_hang_confirmations() -> u32 {
@@ -803,42 +923,157 @@ mod tests {
         assert!(process.executable_path.contains("Application Support"));
     }
 
+    fn process(pid: u32, stat: &str, executable_path: &str) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            ppid: 1,
+            stat: stat.to_string(),
+            cpu: "0.0".to_string(),
+            executable_path: executable_path.to_string(),
+            name: Path::new(executable_path)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        }
+    }
+
     #[test]
-    fn parses_enabled_uuremote_background_item() {
-        let output = r#"Items:
+    fn matches_only_the_bundle_main_executable() {
+        let app = ProcessConfig::default().monitors[0].clone();
+        let processes = vec![
+            process(
+                76472,
+                "S",
+                "/Applications/UURemote.app/Contents/MacOS/UURemoteService",
+            ),
+            process(
+                90305,
+                "S",
+                "/Applications/UURemote.app/Contents/MacOS/UURemote",
+            ),
+        ];
 
- #30:
-                 UUID: DD3BE709-46E6-4CAE-AE9C-0F5D9FF05212
-                 Name: UU远程
-                Type: legacy agent (0x10008)
-          Disposition: [enabled, allowed, not notified] (0x3)
-           Identifier: 8.com.netease.uuremote.agent
-                  URL: /Users/501/Library/LaunchAgents/com.netease.uuremote.agent.plist
+        assert_eq!(find_app_process(&app, &processes).unwrap().pid, 90305);
+    }
 
- #31:
-                 Name: Other
-           Identifier: 2.example.other"#;
+    #[test]
+    fn exited_main_process_is_not_running() {
+        let app = ProcessConfig::default().monitors[0].clone();
+        let processes = vec![process(
+            90305,
+            "Z",
+            "/Applications/UURemote.app/Contents/MacOS/UURemote",
+        )];
+
+        assert!(find_app_process(&app, &processes).is_none());
+    }
+
+    #[test]
+    fn defaults_to_five_second_checks() {
+        assert_eq!(MONITOR_CHECK_INTERVAL_SECONDS, 5);
         assert_eq!(
-            parse_background_item_disposition(output, UU_REMOTE_LOGIN_LABEL),
-            (true, Some(true))
+            ProcessConfig::default().check_interval_seconds,
+            MONITOR_CHECK_INTERVAL_SECONDS
         );
     }
 
     #[test]
-    fn detects_disabled_and_missing_uuremote_background_items() {
-        let disabled = r#"Items:
+    fn missing_main_app_is_confirmed_before_launching() {
+        let config = ProcessConfig::default();
+        let mut runtime = MonitorRuntime::default();
+        let now = Instant::now();
+        let mut launches = 0;
 
- #30:
-                 Name: UU远程
-          Disposition: [disabled, allowed, notified] (0xa)
-           Identifier: 8.com.netease.uuremote.agent"#;
-        assert_eq!(
-            parse_background_item_disposition(disabled, UU_REMOTE_LOGIN_LABEL),
-            (true, Some(false))
+        let first = monitor_tick_with_processes(&config, &mut runtime, &[], now, |_| {
+            launches += 1;
+            Ok(())
+        });
+        assert_eq!(launches, 0);
+        assert_eq!(first[0].status, "应用未运行");
+        assert_eq!(first[0].pid, None);
+        assert!(first[0].message.contains("确认中 1/2"));
+
+        let second = monitor_tick_with_processes(
+            &config,
+            &mut runtime,
+            &[],
+            now + Duration::from_secs(5),
+            |_| {
+                launches += 1;
+                Ok(())
+            },
         );
-        assert_eq!(
-            parse_background_item_disposition("Items:\n", UU_REMOTE_LOGIN_LABEL),
-            (false, None)
+        assert_eq!(launches, 1);
+        assert_eq!(second[0].status, "正在自动启动");
+        assert_eq!(second[0].restarts, 0);
+        assert!(second[0].message.contains("每 5 秒复检主进程"));
+    }
+
+    #[test]
+    fn launch_grace_counts_a_restart_only_after_main_process_appears() {
+        let config = ProcessConfig::default();
+        let mut runtime = MonitorRuntime::default();
+        let now = Instant::now();
+        let mut launches = 0;
+
+        monitor_tick_with_processes(&config, &mut runtime, &[], now, |_| {
+            launches += 1;
+            Ok(())
+        });
+        monitor_tick_with_processes(
+            &config,
+            &mut runtime,
+            &[],
+            now + Duration::from_secs(5),
+            |_| {
+                launches += 1;
+                Ok(())
+            },
         );
+        let found = monitor_tick_with_processes(
+            &config,
+            &mut runtime,
+            &[process(
+                90305,
+                "S",
+                "/Applications/UURemote.app/Contents/MacOS/UURemote",
+            )],
+            now + Duration::from_secs(10),
+            |_| panic!("running app must not be launched again"),
+        );
+
+        assert_eq!(launches, 1);
+        assert_eq!(found[0].status, "正在启动");
+        assert_eq!(found[0].pid, Some(90305));
+        assert_eq!(found[0].restarts, 1);
+    }
+
+    #[test]
+    fn missing_app_waits_for_cooldown_after_launch_attempt() {
+        let config = ProcessConfig::default();
+        let mut runtime = MonitorRuntime::default();
+        let now = Instant::now();
+
+        monitor_tick_with_processes(&config, &mut runtime, &[], now, |_| Ok(()));
+        monitor_tick_with_processes(
+            &config,
+            &mut runtime,
+            &[],
+            now + Duration::from_secs(5),
+            |_| Ok(()),
+        );
+        let waiting = monitor_tick_with_processes(
+            &config,
+            &mut runtime,
+            &[],
+            now + Duration::from_secs(35),
+            |_| panic!("cooldown must block another launch"),
+        );
+
+        assert_eq!(waiting[0].status, "应用未运行");
+        assert_eq!(waiting[0].restarts, 0);
+        assert!(waiting[0].message.contains("等待自动操作冷却结束"));
+        assert!(waiting[0].message.contains("剩余 30 秒"));
     }
 }

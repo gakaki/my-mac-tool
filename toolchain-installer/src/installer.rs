@@ -441,6 +441,40 @@ pub fn find_helper() -> PathBuf {
     })
 }
 
+pub fn configure_environment() -> Result<(), String> {
+    let helper = find_helper();
+    if !helper.is_file() {
+        return Err(format!(
+            "找不到安装引擎 {}；请重新构建或安装 App。",
+            helper.display()
+        ));
+    }
+
+    let output = Command::new(&helper)
+        .arg("setup")
+        .env("PATH", gui_path())
+        .output()
+        .map_err(|error| format!("无法启动开发环境配置：{error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if stderr.is_empty() {
+            stdout
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("开发环境配置失败")
+                .trim()
+                .to_owned()
+        } else {
+            stderr
+        };
+        Err(format!("开发环境配置失败：{detail}"))
+    }
+}
+
 pub(crate) fn gui_path() -> String {
     let home = env::var("HOME").unwrap_or_default();
     format!(

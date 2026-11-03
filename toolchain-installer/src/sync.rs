@@ -1182,7 +1182,6 @@ pub fn rsync_command_preview(options: &SyncOptions) -> Result<String, String> {
     let mut parts = vec![
         "/usr/bin/rsync".to_string(),
         "-aE".to_string(),
-        "--no-r".to_string(),
         "--partial".to_string(),
         "--partial-dir=.mymac-partial".to_string(),
         shell_quote("--rsync-path=/usr/bin/caffeinate -i /usr/bin/rsync"),
@@ -1200,7 +1199,8 @@ pub fn rsync_command_preview(options: &SyncOptions) -> Result<String, String> {
     parts.push(shell_quote(&source));
     parts.push(shell_quote(&destination.to_string_lossy()));
     Ok(format!(
-        "# 应用并发：{} 路（下面为单路等效命令）\n{}",
+        "# 增量同步并发：{} 个独立 rsync 进程（rsync 本身没有 --parallel 参数）。\n\
+         # 首次同步走单路 tar 流；下面是可单独运行的单路 rsync 命令，会递归同步整个目录。\n{}",
         options.jobs,
         parts.join(" ")
     ))
@@ -1901,7 +1901,10 @@ mod tests {
     #[test]
     fn rsync_preview_reflects_options_and_shell_quotes_paths() {
         let command = rsync_command_preview(&test_sync_options("/tmp/Mac Sync/设备 2")).unwrap();
-        assert!(command.starts_with("# 应用并发：4 路"));
+        assert!(command.starts_with("# 增量同步并发：4 个独立 rsync 进程"));
+        assert!(command.contains("rsync 本身没有 --parallel 参数"));
+        assert!(!command.contains("--no-r"));
+        assert!(command.contains("可单独运行的单路 rsync 命令"));
         assert!(command.contains("\n/usr/bin/rsync "));
         assert!(command.contains("-p 2202"));
         assert!(command.contains("--exclude '.DS_Store'"));

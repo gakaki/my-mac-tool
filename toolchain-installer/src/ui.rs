@@ -65,6 +65,8 @@ struct UiState {
     hot_corners: Signal<String>,
     dock_position: Signal<String>,
     finder_view: Signal<String>,
+    desktop_click_reveal: Signal<Option<bool>>,
+    keyboard_repeat_fast: Signal<Option<bool>>,
     rosetta: Signal<String>,
     auto_login: Signal<String>,
     helper_status: Signal<String>,
@@ -82,6 +84,9 @@ struct Actions {
     disable_hot_corners: Rc<dyn Fn()>,
     move_dock_left: Rc<dyn Fn()>,
     configure_finder_list_view: Rc<dyn Fn()>,
+    configure_environment: Rc<dyn Fn()>,
+    set_desktop_click_reveal: Rc<dyn Fn(bool)>,
+    set_keyboard_repeat_fast: Rc<dyn Fn(bool)>,
     run_system_setup: Rc<dyn Fn()>,
     install_rosetta: Rc<dyn Fn()>,
     apply_weak_password: Rc<dyn Fn()>,
@@ -152,9 +157,11 @@ struct SyncUi {
 #[derive(Clone)]
 struct BackgroundUi {
     activities: Signal<Vec<BackgroundActivity>>,
+    selected_ids: Signal<Vec<String>>,
     warning: Signal<Option<String>>,
     status: Signal<String>,
     loading: Signal<bool>,
+    started: Signal<bool>,
     query: Signal<String>,
     draft_name: Signal<String>,
     draft_target: Signal<String>,
@@ -205,12 +212,13 @@ fn format_uu_login_status(status: &processes::UuRemoteLoginStatus) -> String {
             .to_string();
     }
     if !status.launchd_loaded || !status.agent_running {
-        return "已加入系统列表，后台服务当前未运行。点击“自动加入并启用”可立即恢复。".to_string();
+        return "已加入系统列表，后台代理当前未运行。点击“自动加入并启用”可立即恢复。".to_string();
     }
     if !status.launchd_enabled {
         return "已加入系统列表，但 launchd 中的服务被禁用。点击“自动加入并启用”恢复。".to_string();
     }
-    "正常：UU远程已出现在“后台 App 活动”，并已启用、正在运行。".to_string()
+    "正常：UU远程后台代理已加入并启用；此状态不代表主应用已启动，主应用状态见下方“监视应用”。"
+        .to_string()
 }
 
 impl ProcessUi {
@@ -228,7 +236,10 @@ impl ProcessUi {
             monitors: signal(monitors),
             query: signal(String::new()),
             selected_pids: signal(Vec::new()),
-            status: signal("监视器使用 5 秒检查、连续确认和 60 秒重启冷却。".to_string()),
+            status: signal(
+                "监视器每 5 秒复检主进程，连续确认后才启动，并遵守启动宽限与 60 秒冷却。"
+                    .to_string(),
+            ),
             monitor_enabled: signal(enabled),
             monitor_path: signal("/Applications/UURemote.app".to_string()),
             rule_name: signal(String::new()),
@@ -371,9 +382,16 @@ impl ProcessUi {
                 let result = blocking(move || {
                     let mut config = match ui_for_tick.config.lock() {
                         Ok(config) => config.clone(),
-                        Err(_) => return (Vec::new(), Vec::new(), Vec::new(), 5),
+                        Err(_) => {
+                            return (
+                                Vec::new(),
+                                Vec::new(),
+                                Vec::new(),
+                                processes::MONITOR_CHECK_INTERVAL_SECONDS,
+                            );
+                        }
                     };
-                    let interval = config.check_interval_seconds.max(1);
+                    let interval = processes::MONITOR_CHECK_INTERVAL_SECONDS;
                     let snapshots = {
                         let mut runtime = ui_for_tick
                             .runtime
@@ -904,9 +922,11 @@ impl BackgroundUi {
     fn new() -> Self {
         Self {
             activities: signal(Vec::new()),
+            selected_ids: signal(Vec::new()),
             warning: signal(None),
             status: signal("正在准备读取 macOS 后台 App 活动…".to_string()),
             loading: signal(false),
+            started: signal(false),
             query: signal(String::new()),
             draft_name: signal(String::new()),
             draft_target: signal(String::new()),
@@ -919,6 +939,10 @@ impl BackgroundUi {
     }
 
     fn refresh(&self) {
+        self.refresh_with_status(None);
+    }
+
+    fn refresh_with_status(&self, final_status: Option<String>) {
         if self.loading.get() {
             return;
         }
@@ -930,19 +954,35 @@ impl BackgroundUi {
             match blocking(background::scan_activities).await {
                 Ok(scan) => {
                     let count = scan.activities.len();
+                    let present = scan
+                        .activities
+                        .iter()
+                        .map(|activity| activity.id.clone())
+                        .collect::<Vec<_>>();
+                    ui.selected_ids
+                        .update(|selected| selected.retain(|id| present.contains(id)));
                     ui.activities.set(scan.activities);
                     ui.warning.set(scan.warning);
-                    ui.status
-                        .set(format!("已读取 {count} 个后台 App 活动项目。"));
+                    ui.status.set(
+                        final_status
+                            .unwrap_or_else(|| format!("已读取 {count} 个后台 App 活动项目。")),
+                    );
                 }
                 Err(error) => {
-                    ui.warning
-                        .set(Some(format!("读取后台活动失败：{error}")));
+                    ui.warning.set(Some(format!("读取后台活动失败：{error}")));
                     ui.status.set("刷新失败，请稍后重试。".to_string());
                 }
             }
             ui.loading.set(false);
         });
+    }
+
+    fn ensure_started(&self) {
+        if self.started.get() {
+            return;
+        }
+        self.started.set(true);
+        self.refresh();
     }
 
     fn begin_new(&self) {
@@ -956,7 +996,11 @@ impl BackgroundUi {
     }
 
     fn begin_edit(&self, activity: &BackgroundActivity) {
-        let Some(label) = activity.launch_label.as_deref().filter(|_| activity.managed) else {
+        let Some(label) = activity
+            .launch_label
+            .as_deref()
+            .filter(|_| activity.managed)
+        else {
             self.status
                 .set("系统项目不可直接编辑；可打开登录项设置查看。".to_string());
             return;
@@ -971,8 +1015,7 @@ impl BackgroundUi {
                     self.draft_enabled.set(item.enabled);
                     self.draft_run_at_load.set(item.run_at_load);
                     self.draft_keep_alive.set(item.keep_alive);
-                    self.status
-                        .set(format!("正在编辑“{}”。", item.name));
+                    self.status.set(format!("正在编辑“{}”。", item.name));
                 }
                 None => self
                     .status
@@ -1035,20 +1078,20 @@ impl BackgroundUi {
 
     fn toggle(&self, activity: &BackgroundActivity, enabled: bool) {
         let activity = activity.clone();
+        let name = activity.name.clone();
         self.status.set(format!(
             "正在{}“{}”…",
             if enabled { "启用" } else { "关闭" },
-            activity.name
+            name
         ));
         let ui = self.clone();
         spawn(async move {
-            let result =
-                blocking(move || background::set_enabled(&activity, enabled)).await;
+            let result = blocking(move || background::set_enabled(&activity, enabled)).await;
             match result {
                 Ok(Ok(())) => {
                     ui.status.set(format!(
                         "“{}”已{}。",
-                        activity.name,
+                        name,
                         if enabled { "启用" } else { "关闭" }
                     ));
                     ui.refresh();
@@ -1059,32 +1102,81 @@ impl BackgroundUi {
         });
     }
 
-    fn delete(&self, activity: &BackgroundActivity) {
-        let Some(label) = activity.launch_label.clone().filter(|_| activity.managed) else {
+    fn toggle_selected(&self, id: &str) {
+        self.selected_ids.update(|selected| {
+            if let Some(index) = selected.iter().position(|selected_id| selected_id == id) {
+                selected.remove(index);
+            } else {
+                selected.push(id.to_string());
+            }
+        });
+    }
+
+    fn select_all_deletable(&self) {
+        let selected = self
+            .activities
+            .get()
+            .into_iter()
+            .filter(BackgroundActivity::is_deletable)
+            .map(|activity| activity.id)
+            .collect::<Vec<_>>();
+        let count = selected.len();
+        self.selected_ids.set(selected);
+        self.status
+            .set(format!("已选择 {count} 个可删除的后台活动。"));
+    }
+
+    fn clear_selection(&self) {
+        self.selected_ids.set(Vec::new());
+        self.status.set("已清除选择。".to_string());
+    }
+
+    fn delete_one(&self, activity: &BackgroundActivity) {
+        self.delete_many(vec![activity.clone()]);
+    }
+
+    fn delete_selected(&self) {
+        let selected = self.selected_ids.get();
+        let activities = self
+            .activities
+            .get()
+            .into_iter()
+            .filter(|activity| selected.contains(&activity.id) && activity.is_deletable())
+            .collect::<Vec<_>>();
+        if activities.is_empty() {
             self.status
-                .set("系统项目不能从这里删除；自定义活动才可以删除。".to_string());
+                .set("请先勾选至少一个可删除的后台活动。".to_string());
             return;
-        };
-        let name = activity.name.clone();
+        }
+        self.delete_many(activities);
+    }
+
+    fn delete_many(&self, activities: Vec<BackgroundActivity>) {
+        if activities.is_empty() {
+            self.status.set("没有可删除的后台活动。".to_string());
+            return;
+        }
+        let count = activities.len();
+        let edited_label = self.editing_label.get();
+        self.status.set(format!("正在删除 {count} 个后台活动…"));
         let ui = self.clone();
         spawn(async move {
-            let result =
-                blocking(move || background::delete_activity(&label)).await;
+            let result = blocking(move || background::delete_activities(&activities)).await;
             match result {
-                Ok(Ok(())) => {
-                    if ui
-                        .editing_label
-                        .get()
-                        .as_deref()
-                        .is_some_and(|editing| editing == activity.id)
-                    {
+                Ok(Ok(summary)) => {
+                    if edited_label.as_deref().is_some_and(|label| {
+                        summary
+                            .deleted_managed_labels
+                            .iter()
+                            .any(|item| item == label)
+                    }) {
                         ui.begin_new();
                     }
-                    ui.status.set(format!("“{name}”已删除。"));
-                    ui.refresh();
+                    let message = background_delete_message(&summary);
+                    ui.refresh_with_status(Some(message));
                 }
-                Ok(Err(error)) => ui.status.set(error),
-                Err(error) => ui.status.set(format!("删除后台活动失败：{error}")),
+                Ok(Err(error)) => ui.status.set(format!("删除后台活动失败：{error}")),
+                Err(error) => ui.status.set(format!("删除后台活动任务失败：{error}")),
             }
         });
     }
@@ -1099,6 +1191,37 @@ impl BackgroundUi {
             }
         });
     }
+
+    fn open_launch_agents_directory(&self) {
+        let ui = self.clone();
+        spawn(async move {
+            match blocking(background::open_launch_agents_directory).await {
+                Ok(Ok(())) => ui
+                    .status
+                    .set("已打开 ~/Library/LaunchAgents 目录。".to_string()),
+                Ok(Err(error)) => ui.status.set(error),
+                Err(error) => ui
+                    .status
+                    .set(format!("打开 LaunchAgents 目录任务失败：{error}")),
+            }
+        });
+    }
+
+    fn open_full_disk_access(&self) {
+        let app_path = background::full_disk_access_app_path();
+        let ui = self.clone();
+        spawn(async move {
+            match blocking(background::open_full_disk_access_settings).await {
+                Ok(Ok(())) => ui.status.set(format!(
+                    "请在“完全磁盘访问权限”中添加“{app_path}”，授权后重新打开 App 再删除。"
+                )),
+                Ok(Err(error)) => ui.status.set(error),
+                Err(error) => ui
+                    .status
+                    .set(format!("打开完全磁盘访问权限任务失败：{error}")),
+            }
+        });
+    }
 }
 
 fn parse_background_arguments(value: &str) -> Vec<String> {
@@ -1108,6 +1231,34 @@ fn parse_background_arguments(value: &str) -> Vec<String> {
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+fn background_delete_message(summary: &background::DeleteSummary) -> String {
+    let mut parts = if summary.deleted_activities == 0 {
+        vec!["没有删除任何后台活动。".to_string()]
+    } else {
+        vec![format!(
+            "已删除 {} 个后台活动，清理 {} 个启动配置文件，移除 {} 条系统后台登记。",
+            summary.deleted_activities, summary.removed_services, summary.removed_btm_records
+        )]
+    };
+    if !summary.skipped.is_empty() {
+        parts.push(format!(
+            "{} 项关联的启动配置文件已不存在，只清理了后台登记。",
+            summary.skipped.len(),
+        ));
+    }
+    if !summary.failures.is_empty() {
+        parts.push(format!(
+            "{} 项未完成：{}",
+            summary.failures.len(),
+            summary.failures.join("；")
+        ));
+    }
+    parts.push(
+        "系统登记修改前已自动备份；删除后已重启并校验 macOS 后台服务。如设置页仍显示旧内容，关闭再重新打开一次即可。".to_string(),
+    );
+    parts.join(" ")
 }
 
 fn apply_sync_device_config(lane: &SyncLaneUi, config: &sync::SyncDeviceConfig) {
@@ -1909,6 +2060,119 @@ fn make_actions(state: UiState) -> Actions {
         });
     });
 
+    let desktop_reveal_state = state;
+    let set_desktop_click_reveal = Rc::new(move |enabled: bool| {
+        if desktop_reveal_state.helper_working.get() {
+            return;
+        }
+        desktop_reveal_state.helper_working.set(true);
+        desktop_reveal_state.helper_error.set(false);
+        desktop_reveal_state.helper_status.set(format!(
+            "正在{}双击桌面显示桌面…",
+            if enabled { "开启" } else { "关闭" }
+        ));
+        spawn(async move {
+            match blocking(move || system::set_desktop_click_reveal(enabled)).await {
+                Ok(Ok(())) => {
+                    desktop_reveal_state.desktop_click_reveal.set(Some(enabled));
+                    desktop_reveal_state.helper_status.set(format!(
+                        "双击桌面显示桌面已{}。",
+                        if enabled { "开启" } else { "关闭" }
+                    ));
+                }
+                Ok(Err(error)) => {
+                    desktop_reveal_state.helper_status.set(error);
+                    desktop_reveal_state.helper_error.set(true);
+                }
+                Err(error) => {
+                    desktop_reveal_state
+                        .helper_status
+                        .set(format!("双击桌面显示桌面设置任务失败：{error}"));
+                    desktop_reveal_state.helper_error.set(true);
+                }
+            }
+            desktop_reveal_state.helper_working.set(false);
+        });
+    });
+
+    let keyboard_repeat_state = state;
+    let set_keyboard_repeat_fast = Rc::new(move |enabled: bool| {
+        if keyboard_repeat_state.helper_working.get() {
+            return;
+        }
+        keyboard_repeat_state.helper_working.set(true);
+        keyboard_repeat_state.helper_error.set(false);
+        keyboard_repeat_state.helper_status.set(format!(
+            "正在{}键盘最快重复…",
+            if enabled { "开启" } else { "关闭" }
+        ));
+        spawn(async move {
+            match blocking(move || system::set_keyboard_repeat_fast(enabled)).await {
+                Ok(Ok(())) => {
+                    keyboard_repeat_state
+                        .keyboard_repeat_fast
+                        .set(Some(enabled));
+                    match system::save_keyboard_repeat_preference(enabled) {
+                        Ok(()) => keyboard_repeat_state.helper_status.set(if enabled {
+                            "键盘重复已调到最快，重复前延迟已调到最短，系统设置中的两个滑杆会位于最右端。若键盘设置页已经打开，请关闭并重新打开该页查看；部分应用也需重新打开后生效。"
+                                .to_string()
+                        } else {
+                            "键盘重复已恢复 macOS 常规速度。".to_string()
+                        }),
+                        Err(error) => {
+                            keyboard_repeat_state
+                                .helper_status
+                                .set(format!("键盘重复设置已生效，但无法保存默认选择：{error}"));
+                            keyboard_repeat_state.helper_error.set(true);
+                        }
+                    }
+                }
+                Ok(Err(error)) => {
+                    keyboard_repeat_state.helper_status.set(error);
+                    keyboard_repeat_state.helper_error.set(true);
+                }
+                Err(error) => {
+                    keyboard_repeat_state
+                        .helper_status
+                        .set(format!("键盘重复设置任务失败：{error}"));
+                    keyboard_repeat_state.helper_error.set(true);
+                }
+            }
+            keyboard_repeat_state.helper_working.set(false);
+        });
+    });
+
+    let environment_state = state;
+    let configure_environment = Rc::new(move || {
+        if environment_state.helper_working.get() {
+            return;
+        }
+        environment_state.helper_working.set(true);
+        environment_state.helper_error.set(false);
+        environment_state.helper_status.set(
+            "正在配置系统代理 127.0.0.1:7890、终端代理、PATH、npm/Cargo 镜像和 Git 代理…"
+                .to_string(),
+        );
+        spawn(async move {
+            match blocking(installer::configure_environment).await {
+                Ok(Ok(())) => environment_state
+                    .helper_status
+                    .set("系统代理、终端代理、PATH、npm/Cargo 镜像和 Git 代理已配置。".to_string()),
+                Ok(Err(error)) => {
+                    environment_state.helper_status.set(error);
+                    environment_state.helper_error.set(true);
+                }
+                Err(error) => {
+                    environment_state
+                        .helper_status
+                        .set(format!("开发环境配置任务失败：{error}"));
+                    environment_state.helper_error.set(true);
+                }
+            }
+            environment_state.helper_working.set(false);
+        });
+    });
+
     let setup_state = state;
     let run_system_setup = Rc::new(move || {
         if setup_state.helper_working.get() {
@@ -1918,124 +2182,182 @@ fn make_actions(state: UiState) -> Actions {
         setup_state.helper_error.set(false);
         setup_state
             .helper_status
-            .set("一键设置 1/6：正在关闭桌面四角…".to_string());
+            .set("一键设置 1/8：正在关闭桌面四角…".to_string());
         spawn(async move {
             let mut summary = Vec::new();
             let mut failed = false;
 
-            match blocking(system::disable_hot_corners).await {
-                Ok(Ok(())) => {
-                    setup_state
-                        .hot_corners
-                        .set("桌面四角触发已全部关闭".to_string());
-                    summary.push("1/6  桌面四角已关闭".to_string());
-                }
-                Ok(Err(error)) => {
-                    failed = true;
-                    summary.push(format!("1/6  桌面四角失败：{error}"));
-                }
-                Err(error) => {
-                    failed = true;
-                    summary.push(format!("1/6  桌面四角任务失败：{error}"));
-                }
-            }
-
-            setup_state.helper_status.set(format!(
-                "{}\n2/6  正在把 Dock 移到左侧…",
-                summary.join("\n")
-            ));
-            match blocking(system::move_dock_left).await {
-                Ok(Ok(())) => {
-                    setup_state
-                        .dock_position
-                        .set("Dock 位于屏幕左侧".to_string());
-                    summary.push("2/6  Dock 已移到屏幕左侧".to_string());
-                }
-                Ok(Err(error)) => {
-                    failed = true;
-                    summary.push(format!("2/6  Dock 位置失败：{error}"));
-                }
-                Err(error) => {
-                    failed = true;
-                    summary.push(format!("2/6  Dock 位置任务失败：{error}"));
+            if setup_state.hot_corners.get() == "桌面四角触发已全部关闭" {
+                summary.push("1/8  桌面四角已关闭，跳过".to_string());
+            } else {
+                match blocking(system::disable_hot_corners).await {
+                    Ok(Ok(())) => {
+                        setup_state
+                            .hot_corners
+                            .set("桌面四角触发已全部关闭".to_string());
+                        summary.push("1/8  桌面四角已关闭".to_string());
+                    }
+                    Ok(Err(error)) => {
+                        failed = true;
+                        summary.push(format!("1/8  桌面四角失败：{error}"));
+                    }
+                    Err(error) => {
+                        failed = true;
+                        summary.push(format!("1/8  桌面四角任务失败：{error}"));
+                    }
                 }
             }
 
             setup_state.helper_status.set(format!(
-                "{}\n3/6  正在设置 Finder 列表视图…",
+                "{}\n2/8  正在开启双击桌面显示桌面…",
                 summary.join("\n")
             ));
-            match blocking(system::configure_finder_list_view).await {
+            if setup_state.desktop_click_reveal.get() == Some(true) {
+                summary.push("2/8  双击桌面显示桌面已开启，跳过".to_string());
+            } else {
+                match blocking(|| system::set_desktop_click_reveal(true)).await {
+                    Ok(Ok(())) => {
+                        setup_state.desktop_click_reveal.set(Some(true));
+                        summary.push("2/8  双击桌面显示桌面已开启".to_string());
+                    }
+                    Ok(Err(error)) => {
+                        failed = true;
+                        summary.push(format!("2/8  显示桌面设置失败：{error}"));
+                    }
+                    Err(error) => {
+                        failed = true;
+                        summary.push(format!("2/8  显示桌面设置任务失败：{error}"));
+                    }
+                }
+            }
+
+            setup_state.helper_status.set(format!(
+                "{}\n3/8  正在把 Dock 移到左侧…",
+                summary.join("\n")
+            ));
+            if setup_state.dock_position.get() == "Dock 位于屏幕左侧" {
+                summary.push("3/8  Dock 已位于左侧，跳过".to_string());
+            } else {
+                match blocking(system::move_dock_left).await {
+                    Ok(Ok(())) => {
+                        setup_state
+                            .dock_position
+                            .set("Dock 位于屏幕左侧".to_string());
+                        summary.push("3/8  Dock 已移到屏幕左侧".to_string());
+                    }
+                    Ok(Err(error)) => {
+                        failed = true;
+                        summary.push(format!("3/8  Dock 位置失败：{error}"));
+                    }
+                    Err(error) => {
+                        failed = true;
+                        summary.push(format!("3/8  Dock 位置任务失败：{error}"));
+                    }
+                }
+            }
+
+            setup_state.helper_status.set(format!(
+                "{}\n4/8  正在设置 Finder 列表视图…",
+                summary.join("\n")
+            ));
+            if setup_state.finder_view.get() == "Finder 默认使用列表视图，浏览时保持列表"
+            {
+                summary.push("4/8  Finder 已使用列表视图，跳过".to_string());
+            } else {
+                match blocking(system::configure_finder_list_view).await {
+                    Ok(Ok(())) => {
+                        setup_state
+                            .finder_view
+                            .set("Finder 默认使用列表视图，浏览时保持列表".to_string());
+                        summary.push("4/8  Finder 已设为列表视图".to_string());
+                    }
+                    Ok(Err(error)) => {
+                        failed = true;
+                        summary.push(format!("4/8  Finder 视图失败：{error}"));
+                    }
+                    Err(error) => {
+                        failed = true;
+                        summary.push(format!("4/8  Finder 视图任务失败：{error}"));
+                    }
+                }
+            }
+
+            setup_state.helper_status.set(format!(
+                "{}\n5/8  正在配置代理、PATH 与镜像…",
+                summary.join("\n")
+            ));
+            match blocking(installer::configure_environment).await {
                 Ok(Ok(())) => {
-                    setup_state
-                        .finder_view
-                        .set("Finder 默认使用列表视图，浏览时保持列表".to_string());
-                    summary.push("3/6  Finder 已设为列表视图".to_string());
+                    summary.push("5/8  代理、PATH 与镜像已配置".to_string());
                 }
                 Ok(Err(error)) => {
                     failed = true;
-                    summary.push(format!("3/6  Finder 视图失败：{error}"));
+                    summary.push(format!("5/8  开发环境配置失败：{error}"));
                 }
                 Err(error) => {
                     failed = true;
-                    summary.push(format!("3/6  Finder 视图任务失败：{error}"));
+                    summary.push(format!("5/8  开发环境配置任务失败：{error}"));
                 }
             }
 
             setup_state
                 .helper_status
-                .set(format!("{}\n4/6  正在安装 Rosetta 2…", summary.join("\n")));
+                .set(format!("{}\n6/8  正在安装 Rosetta 2…", summary.join("\n")));
             match blocking(system::install_rosetta).await {
                 Ok(Ok(())) => {
                     setup_state.rosetta.set("Rosetta 2 已安装".to_string());
-                    summary.push("4/6  Rosetta 2 已安装".to_string());
+                    summary.push("6/8  Rosetta 2 已安装".to_string());
                 }
                 Ok(Err(error)) => {
                     failed = true;
-                    summary.push(format!("4/6  Rosetta 2 失败：{error}"));
+                    summary.push(format!("6/8  Rosetta 2 失败：{error}"));
                 }
                 Err(error) => {
                     failed = true;
-                    summary.push(format!("4/6  Rosetta 2 任务失败：{error}"));
+                    summary.push(format!("6/8  Rosetta 2 任务失败：{error}"));
                 }
             }
 
             setup_state.helper_status.set(format!(
-                "{}\n5/6  正在设置一个空格密码…",
+                "{}\n7/8  正在设置一个空格密码…",
                 summary.join("\n")
             ));
             match blocking(system::apply_weak_password).await {
                 Ok(Ok(outcome)) => summary.push(format!(
-                    "5/6  弱密码策略已开启并验证账户“{}”",
+                    "7/8  弱密码策略已开启并验证账户“{}”",
                     outcome.account
                 )),
                 Ok(Err(error)) => {
                     failed = true;
-                    summary.push(format!("5/6  弱密码设置失败：{error}"));
+                    summary.push(format!("7/8  弱密码设置失败：{error}"));
                 }
                 Err(error) => {
                     failed = true;
-                    summary.push(format!("5/6  弱密码任务失败：{error}"));
+                    summary.push(format!("7/8  弱密码任务失败：{error}"));
                 }
             }
 
             setup_state
                 .helper_status
-                .set(format!("{}\n6/6  正在启用自动登录…", summary.join("\n")));
-            match blocking(system::enable_space_auto_login).await {
-                Ok(Ok(())) => {
-                    setup_state
-                        .auto_login
-                        .set("自动登录已开启，下次启动将跳过登录密码输入".to_string());
-                    summary.push("6/6  自动登录已开启".to_string());
-                }
-                Ok(Err(error)) => {
-                    failed = true;
-                    summary.push(format!("6/6  自动登录失败：{error}"));
-                }
-                Err(error) => {
-                    failed = true;
-                    summary.push(format!("6/6  自动登录任务失败：{error}"));
+                .set(format!("{}\n8/8  正在启用自动登录…", summary.join("\n")));
+            if setup_state.auto_login.get().contains("已开启") {
+                summary.push("8/8  自动登录已开启，跳过".to_string());
+            } else {
+                match blocking(system::enable_space_auto_login).await {
+                    Ok(Ok(())) => {
+                        setup_state
+                            .auto_login
+                            .set("自动登录已开启，下次启动将跳过登录密码输入".to_string());
+                        summary.push("8/8  自动登录已开启".to_string());
+                    }
+                    Ok(Err(error)) => {
+                        failed = true;
+                        summary.push(format!("8/8  自动登录失败：{error}"));
+                    }
+                    Err(error) => {
+                        failed = true;
+                        summary.push(format!("8/8  自动登录任务失败：{error}"));
+                    }
                 }
             }
 
@@ -2227,6 +2549,9 @@ fn make_actions(state: UiState) -> Actions {
         disable_hot_corners,
         move_dock_left,
         configure_finder_list_view,
+        configure_environment,
+        set_desktop_click_reveal,
+        set_keyboard_repeat_fast,
         run_system_setup,
         install_rosetta,
         apply_weak_password,
@@ -2262,6 +2587,8 @@ pub fn App() -> impl IntoElement {
     let hot_corners = signal("正在读取四角设置…".to_string());
     let dock_position = signal("正在读取 Dock 位置…".to_string());
     let finder_view = signal("正在读取 Finder 视图…".to_string());
+    let desktop_click_reveal = signal::<Option<bool>>(None);
+    let keyboard_repeat_fast = signal::<Option<bool>>(None);
     let rosetta = signal("正在检测 Rosetta…".to_string());
     let auto_login = signal("正在检测自动登录…".to_string());
     let helper_status = signal("系统设置操作完成后会在这里显示结果。".to_string());
@@ -2288,6 +2615,8 @@ pub fn App() -> impl IntoElement {
         hot_corners,
         dock_position,
         finder_view,
+        desktop_click_reveal,
+        keyboard_repeat_fast,
         rosetta,
         auto_login,
         helper_status,
@@ -2301,7 +2630,7 @@ pub fn App() -> impl IntoElement {
     process_ui.start_monitor();
     let sync_ui = SyncUi::new();
     let background_ui = BackgroundUi::new();
-    background_ui.refresh();
+    background_ui.ensure_started();
 
     spawn(async move {
         match blocking(display::detect).await {
@@ -2340,6 +2669,23 @@ pub fn App() -> impl IntoElement {
     });
 
     spawn(async move {
+        if system::load_system_preferences().keyboard_repeat_fast {
+            match blocking(|| system::set_keyboard_repeat_fast(true)).await {
+                Ok(Ok(())) => state.keyboard_repeat_fast.set(Some(true)),
+                Ok(Err(error)) => {
+                    state
+                        .helper_status
+                        .set(format!("默认开启键盘最快重复失败：{error}"));
+                    state.helper_error.set(true);
+                }
+                Err(error) => {
+                    state
+                        .helper_status
+                        .set(format!("默认开启键盘最快重复任务失败：{error}"));
+                    state.helper_error.set(true);
+                }
+            }
+        }
         match blocking(system::detect).await {
             Ok(Ok(detected)) => {
                 state
@@ -2360,6 +2706,12 @@ pub fn App() -> impl IntoElement {
                 } else {
                     "Finder 尚未默认使用列表视图".to_string()
                 });
+                state
+                    .desktop_click_reveal
+                    .set(Some(detected.desktop_click_reveal_enabled));
+                state
+                    .keyboard_repeat_fast
+                    .set(Some(detected.keyboard_repeat_fast));
                 state.auto_login.set(if detected.auto_login_enabled {
                     "自动登录已开启".to_string()
                 } else {
@@ -2575,6 +2927,542 @@ fn sync_page(ui: SyncUi) -> AnyElement {
                     ),
             ),
     )
+}
+
+fn background_page(ui: BackgroundUi) -> AnyElement {
+    let status_ui = ui.clone();
+    let warning_ui = ui.clone();
+
+    page_shell(
+        view()
+            .gap_2()
+            .child(
+                text("后台 App 活动")
+                    .text_size(px(28.0))
+                    .font_weight(FontWeight::BOLD),
+            )
+            .child(
+                text("查看系统后台项目；可新增、编辑、启停，并单条或批量删除全部后台登记")
+                    .text_size(px(13.0))
+                    .text_color(move || theme().muted_foreground),
+            )
+            .child(background_management_card(ui.clone()))
+            .child(background_form_card(ui))
+            .child(
+                muted_card()
+                    .child(
+                        text(move || warning_ui.warning.get().unwrap_or_default())
+                            .text_size(px(12.0))
+                            .text_color(move || theme().destructive),
+                    )
+                    .child(
+                        text(move || status_ui.status.get())
+                            .text_size(px(12.0))
+                            .text_color(move || theme().foreground),
+                    ),
+            ),
+    )
+}
+
+fn background_management_card(ui: BackgroundUi) -> View {
+    let actions_ui = ui.clone();
+    let selection_ui = ui.clone();
+    let list_ui = ui.clone();
+    card()
+        .child(
+            view()
+                .flex_row()
+                .justify_between()
+                .items_center()
+                .child(section_title(
+                    "后台 App 活动",
+                    "列表对应 系统设置 → 通用 → 登录项与扩展 → 后台 App 活动。",
+                ))
+                .child(dynamic(move || {
+                    let loading = actions_ui.loading.get();
+                    let refresh_ui = actions_ui.clone();
+                    let open_settings_ui = actions_ui.clone();
+                    let open_launch_agents_ui = actions_ui.clone();
+                    let open_full_disk_access_ui = actions_ui.clone();
+                    view()
+                        .flex_row()
+                        .flex_wrap()
+                        .justify_end()
+                        .gap_2()
+                        .items_center()
+                        .child(action_button(
+                            if loading {
+                                "刷新中…"
+                            } else {
+                                "刷新列表"
+                            },
+                            false,
+                            move || refresh_ui.refresh(),
+                        ))
+                        .child(action_button("打开系统设置", false, move || {
+                            open_settings_ui
+                                .open_settings("已打开“登录项与扩展”，系统内置项目可在那里管理。")
+                        }))
+                        .child(action_button(
+                            "打开 LaunchAgents 目录",
+                            false,
+                            move || open_launch_agents_ui.open_launch_agents_directory(),
+                        ))
+                        .child(action_button(
+                            "完全磁盘访问权限",
+                            false,
+                            move || open_full_disk_access_ui.open_full_disk_access(),
+                        ))
+                })),
+        )
+        .child(
+            view()
+                .flex_row()
+                .gap_3()
+                .items_center()
+                .child(field("搜索名称、开发者或路径", ui.query)),
+        )
+        .child(dynamic(move || {
+            let selected_count = selection_ui.selected_ids.get().len();
+            let deletable_count = selection_ui
+                .activities
+                .get()
+                .into_iter()
+                .filter(BackgroundActivity::is_deletable)
+                .count();
+            let select_ui = selection_ui.clone();
+            let clear_ui = selection_ui.clone();
+            let delete_ui = selection_ui.clone();
+            view()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .child(
+                    text(format!(
+                        "已选择 {selected_count} 项 · 可直接删除 {deletable_count} 项"
+                    ))
+                    .text_size(px(11.0))
+                    .text_color(move || theme().muted_foreground),
+                )
+                .child(action_button("全选可删除", false, move || {
+                    select_ui.select_all_deletable();
+                }))
+                .child(action_button("清除选择", false, move || {
+                    clear_ui.clear_selection();
+                }))
+                .child(action_button("删除已选", true, move || {
+                    delete_ui.delete_selected();
+                }))
+        }))
+        .child(dynamic(move || {
+            let activities = list_ui.activities.get();
+            let selected_ids = list_ui.selected_ids.get();
+            let loading = list_ui.loading.get();
+            let query = list_ui.query.get().trim().to_ascii_lowercase();
+            let total = activities.len();
+            let managed_count = activities
+                .iter()
+                .filter(|activity| activity.managed)
+                .count();
+            let filtered = activities
+                .into_iter()
+                .filter(|activity| {
+                    query.is_empty()
+                        || activity.name.to_ascii_lowercase().contains(&query)
+                        || activity.developer.to_ascii_lowercase().contains(&query)
+                        || activity
+                            .display_path
+                            .as_deref()
+                            .is_some_and(|path| path.to_ascii_lowercase().contains(&query))
+                })
+                .collect::<Vec<_>>();
+            let shown = filtered.len();
+            let is_empty = filtered.is_empty();
+            let show_empty = is_empty && !loading;
+            let rows = filtered
+                .into_iter()
+                .map(|activity| {
+                    let selected = selected_ids.contains(&activity.id);
+                    background_activity_row(list_ui.clone(), activity, selected)
+                })
+                .collect::<Vec<_>>();
+            let total_text = if loading {
+                format!("共 {total} 项 · 正在刷新…")
+            } else {
+                format!(
+                    "共 {total} 项 · 自定义 {managed_count} 项 · 系统内置 {} 项",
+                    total.saturating_sub(managed_count)
+                )
+            };
+            let list_content =
+                view()
+                    .w_full()
+                    .gap_2()
+                    .children(rows)
+                    .child(when(show_empty, || {
+                        text("没有匹配的后台 App 活动。")
+                            .text_size(px(12.0))
+                            .text_color(move || theme().muted_foreground)
+                    }));
+            view()
+                .w_full()
+                .gap_2()
+                .child(
+                    text(total_text)
+                        .text_size(px(11.0))
+                        .text_color(move || theme().muted_foreground),
+                )
+                .child(
+                    scroll()
+                        .w_full()
+                        .max_h(px(460.0))
+                        .scrollbar(true)
+                        .bounces(false)
+                        .pr_1()
+                        .child(list_content),
+                )
+                .child(when(!loading, move || {
+                    text(format!("当前显示 {shown} 项。"))
+                        .text_size(px(11.0))
+                        .text_color(move || theme().muted_foreground)
+                }))
+        }))
+}
+
+fn background_form_card(ui: BackgroundUi) -> View {
+    let title_ui = ui.clone();
+    let options_ui = ui.clone();
+    let actions_ui = ui.clone();
+    card()
+        .child(dynamic(move || {
+            let editing = title_ui.editing_label.get().is_some();
+            section_title(
+                if editing {
+                    "编辑后台活动"
+                } else {
+                    "新增后台活动"
+                },
+                "保存后会写入 ~/Library/LaunchAgents，并立即按启用状态加载。",
+            )
+        }))
+        .child(
+            view()
+                .flex_row()
+                .gap_3()
+                .child(field("显示名称", ui.draft_name))
+                .child(field("App 或可执行文件路径", ui.draft_target)),
+        )
+        .child(field("启动参数（逗号分隔，可选）", ui.draft_arguments))
+        .child(dynamic(move || {
+            let enabled_ui = options_ui.clone();
+            let run_at_load_ui = options_ui.clone();
+            let keep_alive_ui = options_ui.clone();
+            view()
+                .flex_row()
+                .gap_2()
+                .flex_wrap()
+                .child(background_option_button(
+                    "随登录启动：开",
+                    "随登录启动：关",
+                    options_ui.draft_run_at_load.get(),
+                    move || {
+                        run_at_load_ui
+                            .draft_run_at_load
+                            .update(|value| *value = !*value)
+                    },
+                ))
+                .child(background_option_button(
+                    "保持运行：开",
+                    "保持运行：关",
+                    options_ui.draft_keep_alive.get(),
+                    move || {
+                        keep_alive_ui
+                            .draft_keep_alive
+                            .update(|value| *value = !*value)
+                    },
+                ))
+                .child(background_option_button(
+                    "当前启用",
+                    "当前关闭",
+                    options_ui.draft_enabled.get(),
+                    move || enabled_ui.draft_enabled.update(|value| *value = !*value),
+                ))
+        }))
+        .child(dynamic(move || {
+            let editing = actions_ui.editing_label.get().is_some();
+            let new_ui = actions_ui.clone();
+            let save_ui = actions_ui.clone();
+            let cancel_ui = actions_ui.clone();
+            view()
+                .flex_row()
+                .gap_2()
+                .items_center()
+                .child(action_button("新建活动", false, move || {
+                    new_ui.begin_new();
+                    new_ui
+                        .status
+                        .set("已清空表单，可以新增后台活动。".to_string());
+                }))
+                .child(action_button(
+                    if editing {
+                        "保存修改"
+                    } else {
+                        "新增活动"
+                    },
+                    true,
+                    move || save_ui.save(),
+                ))
+                .child(action_button("取消编辑", false, move || {
+                    cancel_ui.begin_new();
+                    cancel_ui.status.set("已取消编辑。".to_string());
+                }))
+        }))
+        .child(
+            text("新增和编辑只写入用户级 LaunchAgents；删除会同步清理用户级与系统级后台登记、精确关联的启动配置，并自动备份系统数据库。")
+                .text_size(px(11.0))
+                .text_color(move || theme().muted_foreground),
+        )
+}
+
+fn background_activity_row(ui: BackgroundUi, activity: BackgroundActivity, selected: bool) -> View {
+    let name = activity.name.clone();
+    let subtitle = activity.subtitle();
+    let status = activity.status_text();
+    let running = activity.running;
+    let enabled = activity.enabled;
+    let managed = activity.managed;
+    let toggleable = activity.is_toggleable();
+    let deletable = activity.is_deletable();
+    let kind_label = if managed {
+        "本工具"
+    } else {
+        activity.kind.label()
+    };
+    let toggle_ui = ui.clone();
+    let toggle_activity = activity.clone();
+    let edit_ui = ui.clone();
+    let edit_activity = activity.clone();
+    let delete_ui = ui.clone();
+    let delete_activity = activity.clone();
+    let select_ui = ui.clone();
+    let select_id = activity.id.clone();
+
+    let selection = if deletable {
+        view()
+            .w(px(24.0))
+            .h(px(24.0))
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .border_1()
+            .border_color(move || {
+                if selected {
+                    theme().primary
+                } else {
+                    theme().border
+                }
+            })
+            .bg(move || {
+                if selected {
+                    theme().primary
+                } else {
+                    theme().background
+                }
+            })
+            .on_press(move || select_ui.toggle_selected(&select_id))
+            .child(
+                text(if selected { "✓" } else { "" })
+                    .text_size(px(13.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(move || theme().primary_foreground),
+            )
+    } else {
+        view()
+            .w(px(24.0))
+            .h(px(24.0))
+            .items_center()
+            .justify_center()
+            .child(
+                text("—")
+                    .text_size(px(12.0))
+                    .text_color(move || theme().muted_foreground),
+            )
+    };
+
+    let mut row_actions = view().flex_row().gap_2();
+    if managed {
+        row_actions = row_actions.child(action_button("编辑", false, move || {
+            edit_ui.begin_edit(&edit_activity);
+        }));
+    }
+    if deletable {
+        row_actions = row_actions.child(action_button("删除", false, move || {
+            delete_ui.delete_one(&delete_activity);
+        }));
+    } else {
+        row_actions = row_actions.child(
+            text("由系统管理")
+                .text_size(px(11.0))
+                .text_color(move || theme().muted_foreground),
+        );
+    }
+
+    view()
+        .w_full()
+        .p_4()
+        .gap_3()
+        .rounded_lg()
+        .border_1()
+        .border_color(move || theme().border)
+        .bg(move || theme().card)
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .child(selection)
+                .child(background_app_icon(&name))
+                .child(
+                    view()
+                        .flex_1()
+                        .gap_1()
+                        .child(
+                            view()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    text(name)
+                                        .text_size(px(14.0))
+                                        .font_weight(FontWeight::SEMIBOLD),
+                                )
+                                .child(background_badge(kind_label, managed)),
+                        )
+                        .child(
+                            text(subtitle)
+                                .text_size(px(11.0))
+                                .text_color(move || theme().muted_foreground),
+                        )
+                        .child(text(status).text_size(px(11.0)).text_color(move || {
+                            if running {
+                                theme().chart_1
+                            } else {
+                                theme().muted_foreground
+                            }
+                        })),
+                )
+                .child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(row_actions)
+                        .child(toggle_switch(enabled, toggleable, move || {
+                            if toggleable {
+                                toggle_ui.toggle(&toggle_activity, !enabled);
+                            } else {
+                                toggle_ui.open_settings(
+                                    "这个系统项目不能在工具内直接切换，已打开登录项设置。",
+                                );
+                            }
+                        })),
+                ),
+        )
+}
+
+fn background_app_icon(name: &str) -> View {
+    let initial = name
+        .chars()
+        .find(|character| !character.is_whitespace())
+        .map(|character| character.to_uppercase().to_string())
+        .unwrap_or_else(|| "•".to_string());
+    view()
+        .w(px(38.0))
+        .h(px(38.0))
+        .rounded_lg()
+        .items_center()
+        .justify_center()
+        .bg(move || theme().muted)
+        .child(
+            text(initial)
+                .text_size(px(16.0))
+                .font_weight(FontWeight::BOLD)
+                .text_color(move || theme().muted_foreground),
+        )
+}
+
+fn background_badge(label: &'static str, managed: bool) -> View {
+    view()
+        .px_2()
+        .py_1()
+        .rounded_full()
+        .bg(move || {
+            if managed {
+                theme().primary
+            } else {
+                theme().muted
+            }
+        })
+        .child(
+            text(label)
+                .text_size(px(9.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(move || {
+                    if managed {
+                        theme().primary_foreground
+                    } else {
+                        theme().muted_foreground
+                    }
+                }),
+        )
+}
+
+fn toggle_switch(enabled: bool, enabled_tone: bool, action: impl Fn() + 'static) -> View {
+    let thumb = || {
+        view()
+            .w(px(20.0))
+            .h(px(20.0))
+            .rounded_full()
+            .bg(move || theme().background)
+    };
+    let track = if enabled {
+        view()
+            .w_full()
+            .flex_row()
+            .items_center()
+            .justify_end()
+            .child(thumb())
+    } else {
+        view().w_full().flex_row().items_center().child(thumb())
+    };
+    view()
+        .w(px(44.0))
+        .h(px(24.0))
+        .p(px(2.0))
+        .rounded_full()
+        .bg(move || {
+            if enabled {
+                if enabled_tone {
+                    theme().primary
+                } else {
+                    theme().muted_foreground
+                }
+            } else {
+                theme().muted
+            }
+        })
+        .on_press(move || action())
+        .child(track)
+}
+
+fn background_option_button(
+    on_label: &'static str,
+    off_label: &'static str,
+    checked: bool,
+    action: impl Fn() + 'static,
+) -> View {
+    action_button(if checked { on_label } else { off_label }, checked, action)
 }
 
 fn sync_device_card(ui: SyncUi, index: usize) -> View {
@@ -2806,12 +3694,14 @@ fn sync_device_card(ui: SyncUi, index: usize) -> View {
         .child(
             muted_card()
                 .child(
-                    text("等效 rsync 调试命令（表单修改后实时更新）")
+                    text("调试用 rsync 命令（可复制运行，表单修改后实时更新）")
                         .text_size(px(12.0))
                         .font_weight(FontWeight::SEMIBOLD),
                 )
                 .child(
-                    text("这是单路等效命令；应用会按并发数把文件清单拆成多个工作单元。")
+                    text(
+                        "rsync 没有并发参数；增量同步时应用会同时启动多个独立 rsync 进程，每个处理一份文件分片。首次同步走单路 tar 流；下面显示单路 rsync 的可运行命令。",
+                    )
                         .text_size(px(11.0))
                         .text_color(move || theme().muted_foreground),
                 )
@@ -2820,7 +3710,7 @@ fn sync_device_card(ui: SyncUi, index: usize) -> View {
                         .readonly(true)
                         .multiline(true)
                         .value(move || command_ui.lanes[index].command_preview.get())
-                        .h(px(92.0))
+                        .h(px(132.0))
                         .p_3()
                         .rounded_md()
                         .border_1()
@@ -3100,6 +3990,9 @@ fn system_page(state: UiState, actions: &Actions) -> AnyElement {
     let corners = actions.disable_hot_corners.clone();
     let dock_left = actions.move_dock_left.clone();
     let finder_list = actions.configure_finder_list_view.clone();
+    let configure_environment = actions.configure_environment.clone();
+    let desktop_click_reveal = actions.set_desktop_click_reveal.clone();
+    let keyboard_repeat = actions.set_keyboard_repeat_fast.clone();
     let run_all = actions.run_system_setup.clone();
     let rosetta = actions.install_rosetta.clone();
     let weak = actions.apply_weak_password.clone();
@@ -3115,14 +4008,14 @@ fn system_page(state: UiState, actions: &Actions) -> AnyElement {
                     .font_weight(FontWeight::BOLD),
             )
             .child(
-                text("macOS 辅助设置")
+                text("开发环境与 macOS 辅助设置")
                     .text_size(px(13.0))
                     .text_color(move || theme().muted_foreground),
             )
             .child(
                 card()
                     .child(section_title(
-                        "macOS 辅助设置",
+                        "开发环境与 macOS 辅助设置",
                         "需要管理员权限时会使用 macOS 原生授权窗口。",
                     ))
                     .child(
@@ -3133,12 +4026,24 @@ fn system_page(state: UiState, actions: &Actions) -> AnyElement {
                                     .font_weight(FontWeight::SEMIBOLD),
                             )
                             .child(
-                                text("关闭四角 · Dock 左侧 · Finder 列表 · Rosetta · 一个空格密码 · 自动登录")
+                                text("代理/PATH/镜像 · 关闭四角 · 显示桌面 · Dock 左侧 · Finder 列表 · Rosetta · 一个空格密码 · 自动登录")
                                     .text_size(px(11.0))
                                     .text_color(move || theme().muted_foreground),
                             )
                             .child(action_button("一键设置全部", true, move || run_all())),
                     )
+                    .child(separator())
+                    .child(system_action_row(
+                        "开发环境",
+                        move || {
+                            "系统代理 127.0.0.1:7890、终端代理、PATH、npm/Cargo 镜像和 Git 代理"
+                                .to_string()
+                        },
+                        "调用内置安装引擎执行 setup，不会安装或更新编程工具。",
+                        "配置代理、PATH 与镜像",
+                        false,
+                        move || configure_environment(),
+                    ))
                     .child(separator())
                     .child(system_action_row(
                         "桌面四角",
@@ -3147,6 +4052,22 @@ fn system_page(state: UiState, actions: &Actions) -> AnyElement {
                         "关闭四角桌面触发",
                         false,
                         move || corners(),
+                    ))
+                    .child(separator())
+                    .child(system_toggle_row(
+                        "双击桌面显示桌面",
+                        move || match state.desktop_click_reveal.get() {
+                            Some(true) => {
+                                "已开启：双击桌面空白处会移开窗口并显示桌面。".to_string()
+                            }
+                            Some(false) => "已关闭：双击桌面不会移开窗口。".to_string(),
+                            None => "正在检测双击桌面显示桌面设置…".to_string(),
+                        },
+                        "对应 macOS「桌面与程序坞 → 点按墙纸显示桌面」。",
+                        move || state.desktop_click_reveal.get().unwrap_or(false),
+                        move || {
+                            desktop_click_reveal(!state.desktop_click_reveal.get().unwrap_or(false))
+                        },
                     ))
                     .child(separator())
                     .child(system_action_row(
@@ -3165,6 +4086,24 @@ fn system_page(state: UiState, actions: &Actions) -> AnyElement {
                         "设为默认列表视图",
                         false,
                         move || finder_list(),
+                    ))
+                    .child(separator())
+                    .child(system_toggle_row(
+                        "键盘最快重复",
+                        move || match state.keyboard_repeat_fast.get() {
+                            Some(true) => {
+                                "已开启：重复速率最快，重复前延迟最短。".to_string()
+                            }
+                            Some(false) => {
+                                "已关闭：使用 macOS 常规键盘重复速度。".to_string()
+                            }
+                            None => "正在检测键盘重复设置…".to_string(),
+                        },
+                        "对应 macOS「键盘 → 键重复速率」与「重复前延迟」；默认开启。",
+                        move || state.keyboard_repeat_fast.get().unwrap_or(false),
+                        move || {
+                            keyboard_repeat(!state.keyboard_repeat_fast.get().unwrap_or(false))
+                        },
                     ))
                     .child(separator())
                     .child(system_action_row(
@@ -3244,6 +4183,45 @@ fn system_action_row(
         .child(action_button(button, primary, action))
 }
 
+fn system_toggle_row(
+    title: &'static str,
+    detail: impl Fn() -> String + 'static,
+    hint: &'static str,
+    enabled: impl Fn() -> bool + 'static,
+    action: impl Fn() + 'static,
+) -> View {
+    let action = Rc::new(action);
+    view()
+        .flex_row()
+        .items_center()
+        .gap_3()
+        .child(
+            view()
+                .flex_1()
+                .gap_2()
+                .child(
+                    text(title)
+                        .text_size(px(14.0))
+                        .font_weight(FontWeight::SEMIBOLD),
+                )
+                .child(
+                    text(detail)
+                        .text_size(px(12.0))
+                        .text_color(move || theme().muted_foreground),
+                )
+                .child(
+                    text(hint)
+                        .text_size(px(11.0))
+                        .text_color(move || theme().muted_foreground),
+                ),
+        )
+        .child(dynamic(move || {
+            let current = enabled();
+            let action = action.clone();
+            toggle_switch(current, true, move || action())
+        }))
+}
+
 fn separator() -> View {
     view().w_full().h(px(1.0)).bg(move || theme().border)
 }
@@ -3267,7 +4245,7 @@ fn auto_start_page(_state: UiState, ui: ProcessUi) -> AnyElement {
     let login_badge = if ui.uu_login_working.get() {
         "检测中"
     } else if login_ready {
-        "已加入并启用"
+        "后台代理已启用"
     } else if login_disabled {
         "已加入但关闭"
     } else {
@@ -3307,9 +4285,9 @@ fn auto_start_page(_state: UiState, ui: ProcessUi) -> AnyElement {
             status.background_item_registered && status.background_item_enabled != Some(false),
         ));
         login_rows.push(process_status_row(
-            "后台服务",
+            "后台代理",
             if status.agent_running {
-                "正在运行"
+                "代理进程运行中"
             } else if status.launchd_loaded {
                 "已载入 · 未运行"
             } else {
@@ -3372,8 +4350,13 @@ fn auto_start_page(_state: UiState, ui: ProcessUi) -> AnyElement {
             )
             .child(
                 text(format!(
-                    "{} · 自动启动/重启 {} 次",
-                    snapshot.message, snapshot.restarts
+                    "PID {} · {} · 自动启动/重启 {} 次",
+                    snapshot
+                        .pid
+                        .map(|pid| pid.to_string())
+                        .unwrap_or_else(|| "—".to_string()),
+                    snapshot.message,
+                    snapshot.restarts
                 ))
                 .text_size(px(11.0))
                 .text_color(move || theme().muted_foreground),
@@ -3402,7 +4385,7 @@ fn auto_start_page(_state: UiState, ui: ProcessUi) -> AnyElement {
                             .items_center()
                             .child(section_title(
                                 "UU远程后台登录项",
-                                "对应 系统设置 → 通用 → 登录项与扩展 → 后台 App 活动；服务标识 com.netease.uuremote.agent。",
+                                "此处只检查后台代理，不代表主应用已启动；主应用状态见下方“监视应用”。服务标识 com.netease.uuremote.agent。",
                             ))
                             .child(
                                 text(login_badge)
@@ -3477,7 +4460,7 @@ fn auto_start_page(_state: UiState, ui: ProcessUi) -> AnyElement {
                             .items_center()
                             .child(section_title(
                                 "监视应用",
-                                "默认监视 /Applications/UURemote.app；进程缺失后自动启动。",
+                                "默认监视 /Applications/UURemote.app；仅按主可执行文件精确匹配，辅助进程不算应用已启动。",
                             ))
                             .child(action_button(
                                 if enabled {

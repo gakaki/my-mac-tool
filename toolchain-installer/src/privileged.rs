@@ -2,6 +2,10 @@ use std::ffi::OsStr;
 use std::process::Command;
 
 pub fn run(shell_command: &str) -> Result<(), String> {
+    run_capture(shell_command).map(|_| ())
+}
+
+pub fn run_capture(shell_command: &str) -> Result<String, String> {
     let apple_script = format!(
         "do shell script \"{}\" with administrator privileges",
         shell_command.replace('\\', "\\\\").replace('"', "\\\"")
@@ -11,7 +15,7 @@ pub fn run(shell_command: &str) -> Result<(), String> {
         .output()
         .map_err(|error| format!("无法请求管理员权限：{error}"))?;
     if output.status.success() {
-        return Ok(());
+        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr);

@@ -1,4 +1,5 @@
 use crate::privileged::{run as run_privileged, shell_quote};
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,14 +11,41 @@ const CORNERS: [(&str, &str); 4] = [
     ("左下角", "wvous-bl-corner"),
     ("右下角", "wvous-br-corner"),
 ];
+const WINDOW_MANAGER_DOMAIN: &str = "com.apple.WindowManager";
+const CLICK_TO_SHOW_DESKTOP_KEY: &str = "EnableStandardClickToShowDesktop";
+const KEY_REPEAT_FASTEST: i64 = 2;
+const INITIAL_KEY_REPEAT_FASTEST: i64 = 15;
+const KEY_REPEAT_DEFAULT: i64 = 6;
+const INITIAL_KEY_REPEAT_DEFAULT: i64 = 25;
+const SYSTEM_PREFERENCES_FILE: &str = "system-preferences.json";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SystemStatus {
     pub active_hot_corners: Vec<String>,
     pub dock_position: String,
     pub finder_list_view: bool,
+    pub desktop_click_reveal_enabled: bool,
+    pub keyboard_repeat_fast: bool,
     pub rosetta_installed: bool,
     pub auto_login_enabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SystemPreferences {
+    #[serde(default = "default_keyboard_repeat_fast")]
+    pub keyboard_repeat_fast: bool,
+}
+
+impl Default for SystemPreferences {
+    fn default() -> Self {
+        Self {
+            keyboard_repeat_fast: true,
+        }
+    }
+}
+
+fn default_keyboard_repeat_fast() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -33,6 +61,8 @@ pub fn detect() -> Result<SystemStatus, String> {
         active_hot_corners: active_hot_corners()?,
         dock_position: dock_position_label()?,
         finder_list_view: finder_list_view_enabled()?,
+        desktop_click_reveal_enabled: desktop_click_reveal_enabled()?,
+        keyboard_repeat_fast: keyboard_repeat_fast_enabled()?,
         rosetta_installed: rosetta_installed(),
         auto_login_enabled: auto_login_enabled()?,
     })
@@ -135,6 +165,113 @@ pub fn configure_finder_list_view() -> Result<(), String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
+}
+
+pub fn desktop_click_reveal_enabled() -> Result<bool, String> {
+    let output = Command::new("/usr/bin/defaults")
+        .args(["read", WINDOW_MANAGER_DOMAIN, CLICK_TO_SHOW_DESKTOP_KEY])
+        .output()
+        .map_err(|error| format!("无法读取双击桌面显示桌面设置：{error}"))?;
+    if output.status.success() {
+        parse_defaults_bool(String::from_utf8_lossy(&output.stdout).trim()).ok_or_else(|| {
+            format!(
+                "无法解析双击桌面显示桌面设置：{}",
+                String::from_utf8_lossy(&output.stdout).trim()
+            )
+        })
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if missing_default_key(&stderr) {
+            Ok(true)
+        } else {
+            Err(format!("无法读取双击桌面显示桌面设置：{}", stderr.trim()))
+        }
+    }
+}
+
+pub fn set_desktop_click_reveal(enabled: bool) -> Result<(), String> {
+    let output = Command::new("/usr/bin/defaults")
+        .args([
+            "write",
+            WINDOW_MANAGER_DOMAIN,
+            CLICK_TO_SHOW_DESKTOP_KEY,
+            "-bool",
+            if enabled { "true" } else { "false" },
+        ])
+        .output()
+        .map_err(|error| format!("无法修改双击桌面显示桌面设置：{error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "无法修改双击桌面显示桌面设置：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let output = Command::new("/usr/bin/killall")
+        .arg("WindowManager")
+        .output()
+        .map_err(|error| format!("设置已写入，但无法重新载入窗口管理器：{error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "设置已写入，但窗口管理器重新载入失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+pub fn keyboard_repeat_fast_enabled() -> Result<bool, String> {
+    Ok(keyboard_repeat_is_fastest(
+        read_global_integer("KeyRepeat")?,
+        read_global_integer("InitialKeyRepeat")?,
+    ))
+}
+
+pub fn set_keyboard_repeat_fast(enabled: bool) -> Result<(), String> {
+    let (key_repeat, initial_key_repeat) = keyboard_repeat_values(enabled);
+    write_global_integer("KeyRepeat", key_repeat)?;
+    write_global_integer("InitialKeyRepeat", initial_key_repeat)?;
+
+    let actual_key_repeat = read_global_integer("KeyRepeat")?;
+    let actual_initial_key_repeat = read_global_integer("InitialKeyRepeat")?;
+    if actual_key_repeat == Some(key_repeat)
+        && actual_initial_key_repeat == Some(initial_key_repeat)
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "键盘重复设置未生效：KeyRepeat={}，InitialKeyRepeat={}",
+            actual_key_repeat
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "缺失".to_string()),
+            actual_initial_key_repeat
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "缺失".to_string())
+        ))
+    }
+}
+
+pub fn load_system_preferences() -> SystemPreferences {
+    let Ok(path) = system_preferences_path() else {
+        return SystemPreferences::default();
+    };
+    let Ok(bytes) = fs::read(path) else {
+        return SystemPreferences::default();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+pub fn save_keyboard_repeat_preference(enabled: bool) -> Result<(), String> {
+    let path = system_preferences_path()?;
+    let mut preferences = load_system_preferences();
+    preferences.keyboard_repeat_fast = enabled;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("无法创建设置目录：{error}"))?;
+    }
+    let bytes = serde_json::to_vec_pretty(&preferences)
+        .map_err(|error| format!("无法编码系统设置：{error}"))?;
+    fs::write(path, bytes).map_err(|error| format!("无法保存键盘重复设置：{error}"))
 }
 
 fn dock_position_label() -> Result<String, String> {
@@ -319,6 +456,56 @@ fn read_dock_integer(key: &str) -> Result<i64, String> {
     }
 }
 
+fn read_global_integer(key: &str) -> Result<Option<i64>, String> {
+    let output = Command::new("/usr/bin/defaults")
+        .args(["read", "-g", key])
+        .output()
+        .map_err(|error| format!("无法读取键盘重复设置：{error}"))?;
+    if output.status.success() {
+        let value = String::from_utf8_lossy(&output.stdout);
+        return value
+            .trim()
+            .parse::<i64>()
+            .map(Some)
+            .map_err(|error| format!("无法解析键盘重复设置 {key}：{error}"));
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if missing_default_key(&stderr) {
+        Ok(None)
+    } else {
+        Err(format!("无法读取键盘重复设置 {key}：{}", stderr.trim()))
+    }
+}
+
+fn write_global_integer(key: &str, value: i64) -> Result<(), String> {
+    let output = Command::new("/usr/bin/defaults")
+        .args(["write", "-g", key, "-int", &value.to_string()])
+        .output()
+        .map_err(|error| format!("无法修改键盘重复设置：{error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "无法修改键盘重复设置 {key}：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn keyboard_repeat_is_fastest(key_repeat: Option<i64>, initial_key_repeat: Option<i64>) -> bool {
+    key_repeat.is_some_and(|value| value <= KEY_REPEAT_FASTEST)
+        && initial_key_repeat.is_some_and(|value| value <= INITIAL_KEY_REPEAT_FASTEST)
+}
+
+fn keyboard_repeat_values(enabled: bool) -> (i64, i64) {
+    if enabled {
+        (KEY_REPEAT_FASTEST, INITIAL_KEY_REPEAT_FASTEST)
+    } else {
+        (KEY_REPEAT_DEFAULT, INITIAL_KEY_REPEAT_DEFAULT)
+    }
+}
+
 fn read_loginwindow_string(key: &str) -> Result<Option<String>, String> {
     let output = Command::new("/usr/bin/defaults")
         .args(["read", "/Library/Preferences/com.apple.loginwindow", key])
@@ -341,6 +528,21 @@ fn missing_default_key(stderr: &str) -> bool {
     stderr.contains("Could not find key")
         || stderr.contains("does not exist")
         || stderr.contains("not found")
+}
+
+fn parse_defaults_bool(value: &str) -> Option<bool> {
+    match value {
+        "1" | "true" | "YES" => Some(true),
+        "0" | "false" | "NO" => Some(false),
+        _ => None,
+    }
+}
+
+fn system_preferences_path() -> Result<PathBuf, String> {
+    let home = env::var_os("HOME").ok_or_else(|| "无法确定用户目录".to_string())?;
+    Ok(PathBuf::from(home)
+        .join("Library/Application Support/MacSettingsDevTools")
+        .join(SYSTEM_PREFERENCES_FILE))
 }
 
 fn backup_policy(
@@ -488,5 +690,33 @@ mod tests {
         assert_eq!(dock_label("left"), "Dock 位于屏幕左侧");
         assert_eq!(dock_label("right"), "Dock 位于屏幕右侧");
         assert_eq!(dock_label("bottom"), "Dock 位于屏幕底部");
+    }
+
+    #[test]
+    fn parses_defaults_boolean_values() {
+        assert_eq!(parse_defaults_bool("1"), Some(true));
+        assert_eq!(parse_defaults_bool("true"), Some(true));
+        assert_eq!(parse_defaults_bool("0"), Some(false));
+        assert_eq!(parse_defaults_bool("false"), Some(false));
+        assert_eq!(parse_defaults_bool("unexpected"), None);
+    }
+
+    #[test]
+    fn recognizes_fastest_keyboard_repeat_values() {
+        assert!(keyboard_repeat_is_fastest(Some(2), Some(15)));
+        assert!(keyboard_repeat_is_fastest(Some(1), Some(10)));
+        assert!(!keyboard_repeat_is_fastest(Some(3), Some(15)));
+        assert!(!keyboard_repeat_is_fastest(Some(2), Some(16)));
+        assert!(!keyboard_repeat_is_fastest(None, Some(15)));
+        assert!(!keyboard_repeat_is_fastest(Some(2), None));
+        assert_eq!(keyboard_repeat_values(true), (2, 15));
+        assert_eq!(keyboard_repeat_values(false), (6, 25));
+    }
+
+    #[test]
+    fn keyboard_repeat_preference_defaults_to_enabled() {
+        assert!(SystemPreferences::default().keyboard_repeat_fast);
+        let preferences: SystemPreferences = serde_json::from_str("{}").unwrap();
+        assert!(preferences.keyboard_repeat_fast);
     }
 }

@@ -73,6 +73,18 @@ fn main() {
 
 fn entrypoint() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
+    if args.first().is_some_and(|value| value == "__btm-check") {
+        return check_btm_store(&args[1..]);
+    }
+    if args.first().is_some_and(|value| value == "__btm-remove") {
+        return remove_btm_records(&args[1..]);
+    }
+    if args
+        .first()
+        .is_some_and(|value| value == "__btm-remove-related")
+    {
+        return remove_related_btm_records(&args[1..]);
+    }
     match args.as_slice() {
         [] => {
             print_help();
@@ -96,6 +108,49 @@ fn entrypoint() -> Result<()> {
             Err("invalid arguments".to_string())
         }
     }
+}
+
+fn check_btm_store(args: &[String]) -> Result<()> {
+    let [path] = args else {
+        return Err("invalid internal BTM check arguments".to_string());
+    };
+    mac_settings_ui::check_background_store_for_helper(path)
+}
+
+fn remove_btm_records(args: &[String]) -> Result<()> {
+    let [path, uid, generated_uid, identifiers @ ..] = args else {
+        return Err("invalid internal BTM arguments".to_string());
+    };
+    if identifiers.is_empty() {
+        return Err("no BTM identifiers supplied".to_string());
+    }
+    let uid = uid
+        .parse::<u32>()
+        .map_err(|_| "invalid internal BTM uid".to_string())?;
+    let output = mac_settings_ui::remove_background_records_for_helper(
+        path,
+        uid,
+        generated_uid,
+        identifiers,
+    )?;
+    println!("{output}");
+    Ok(())
+}
+
+fn remove_related_btm_records(args: &[String]) -> Result<()> {
+    let [uid, home, identifiers @ ..] = args else {
+        return Err("invalid internal related BTM arguments".to_string());
+    };
+    if identifiers.is_empty() {
+        return Err("no BTM identifiers supplied".to_string());
+    }
+    let uid = uid
+        .parse::<u32>()
+        .map_err(|_| "invalid internal BTM uid".to_string())?;
+    let output =
+        mac_settings_ui::remove_related_background_records_for_helper(uid, home, identifiers)?;
+    println!("{output}");
+    Ok(())
 }
 
 fn print_help() {

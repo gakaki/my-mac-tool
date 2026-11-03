@@ -1,3 +1,4 @@
+use crate::background::{self, BackgroundActivity};
 use crate::display::{self, Detection, DisplayInfo, TargetMode};
 use crate::installer::{self, Event, TaskState};
 use crate::processes::{self, KillRule, MonitorSnapshot, ProcessConfig, ProcessInfo};
@@ -20,6 +21,7 @@ const TAB_SYSTEM: usize = 2;
 const TAB_AUTO_START: usize = 3;
 const TAB_AUTO_CLEAN: usize = 4;
 const TAB_SYNC: usize = 5;
+const TAB_BACKGROUND: usize = 6;
 
 #[derive(Clone, PartialEq)]
 struct InstallTask {
@@ -105,17 +107,21 @@ struct ProcessUi {
     rule_terms: Signal<String>,
     rule_startup: Signal<bool>,
     editing_rule: Signal<Option<usize>>,
+    uu_login_status: Signal<Option<processes::UuRemoteLoginStatus>>,
+    uu_login_message: Signal<String>,
+    uu_login_working: Signal<bool>,
 }
 
 #[derive(Clone)]
-struct SyncUi {
+struct SyncLaneUi {
+    title: &'static str,
+    enabled: Signal<bool>,
     host: Signal<String>,
     user: Signal<String>,
     port: Signal<String>,
     remote_path: Signal<String>,
     local_path: Signal<String>,
     jobs: Signal<String>,
-    ignore_patterns: Signal<String>,
     delete_missing: Signal<bool>,
     status: Signal<String>,
     detail: Signal<String>,
@@ -128,10 +134,35 @@ struct SyncUi {
     elapsed: Signal<String>,
     heartbeat: Signal<String>,
     batch_summary: Signal<String>,
+    command_preview: Signal<String>,
     running: Signal<bool>,
     success: Signal<bool>,
     cancel: Arc<AtomicBool>,
     runtime: Arc<Mutex<SyncUiRuntime>>,
+}
+
+#[derive(Clone)]
+struct SyncUi {
+    lanes: [SyncLaneUi; 2],
+    ignore_patterns: Signal<String>,
+    config_status: Signal<String>,
+    config_success: Signal<bool>,
+}
+
+#[derive(Clone)]
+struct BackgroundUi {
+    activities: Signal<Vec<BackgroundActivity>>,
+    warning: Signal<Option<String>>,
+    status: Signal<String>,
+    loading: Signal<bool>,
+    query: Signal<String>,
+    draft_name: Signal<String>,
+    draft_target: Signal<String>,
+    draft_arguments: Signal<String>,
+    draft_enabled: Signal<bool>,
+    draft_run_at_load: Signal<bool>,
+    draft_keep_alive: Signal<bool>,
+    editing_label: Signal<Option<String>>,
 }
 
 #[derive(Default)]
@@ -152,6 +183,34 @@ fn initial_tasks() -> Vec<InstallTask> {
         InstallTask::new("cloudflared"),
         InstallTask::new("Flutter Android"),
     ]
+}
+
+fn format_uu_login_status(status: &processes::UuRemoteLoginStatus) -> String {
+    if !status.app_installed {
+        return "未找到 /Applications/UURemote.app，请先安装 UU远程。".to_string();
+    }
+    if !status.bundled_agent_available {
+        return "UU远程已安装，但应用内缺少官方后台代理配置。".to_string();
+    }
+    if !status.login_item_installed {
+        return "未加入：系统设置的“后台 App 活动”中还没有 UU远程。点击“自动加入并启用”。"
+            .to_string();
+    }
+    if status.background_item_enabled == Some(false) {
+        return "已加入，但在“后台 App 活动”中处于关闭状态。请打开登录项设置并开启 UU远程。"
+            .to_string();
+    }
+    if !status.background_item_registered {
+        return "后台登录文件已安装，但 macOS 尚未将其登记到“后台 App 活动”。请重新点击“自动加入并启用”。"
+            .to_string();
+    }
+    if !status.launchd_loaded || !status.agent_running {
+        return "已加入系统列表，后台服务当前未运行。点击“自动加入并启用”可立即恢复。".to_string();
+    }
+    if !status.launchd_enabled {
+        return "已加入系统列表，但 launchd 中的服务被禁用。点击“自动加入并启用”恢复。".to_string();
+    }
+    "正常：UU远程已出现在“后台 App 活动”，并已启用、正在运行。".to_string()
 }
 
 impl ProcessUi {
@@ -176,6 +235,9 @@ impl ProcessUi {
             rule_terms: signal(String::new()),
             rule_startup: signal(true),
             editing_rule: signal(None),
+            uu_login_status: signal(None),
+            uu_login_message: signal("正在检测 UU远程后台登录项…".to_string()),
+            uu_login_working: signal(false),
         }
     }
 
@@ -216,6 +278,69 @@ impl ProcessUi {
             "规则已保存；当前没有匹配的进程或启动项。".to_string()
         } else {
             messages.join("\n")
+        });
+    }
+
+    fn refresh_uu_login_item(&self) {
+        if self.uu_login_working.get() {
+            return;
+        }
+        self.uu_login_working.set(true);
+        self.uu_login_message
+            .set("正在检测系统设置中的“后台 App 活动”…".to_string());
+        let ui = self.clone();
+        spawn(async move {
+            match blocking(processes::inspect_uu_remote_login_item).await {
+                Ok(Ok(status)) => {
+                    ui.uu_login_message.set(format_uu_login_status(&status));
+                    ui.uu_login_status.set(Some(status));
+                }
+                Ok(Err(error)) => ui.uu_login_message.set(error),
+                Err(error) => ui
+                    .uu_login_message
+                    .set(format!("检测 UU远程后台登录项失败：{error}")),
+            }
+            ui.uu_login_working.set(false);
+        });
+    }
+
+    fn ensure_uu_login_item(&self) {
+        if self.uu_login_working.get() {
+            return;
+        }
+        self.uu_login_working.set(true);
+        self.uu_login_message
+            .set("正在安装并启用 UU远程后台登录项…".to_string());
+        let ui = self.clone();
+        spawn(async move {
+            match blocking(processes::ensure_uu_remote_login_item).await {
+                Ok(Ok(status)) => {
+                    ui.uu_login_message.set(format_uu_login_status(&status));
+                    ui.uu_login_status.set(Some(status));
+                }
+                Ok(Err(error)) => ui.uu_login_message.set(error),
+                Err(error) => ui
+                    .uu_login_message
+                    .set(format!("安装 UU远程后台登录项失败：{error}")),
+            }
+            ui.uu_login_working.set(false);
+        });
+    }
+
+    fn open_uu_login_settings(&self) {
+        let ui = self.clone();
+        spawn(async move {
+            match blocking(processes::open_login_items_settings).await {
+                Ok(Ok(())) => ui.uu_login_message.set(
+                    "已打开“登录项与扩展”。请在“后台 App 活动”中确认 UU远程已开启。".to_string(),
+                ),
+                Ok(Err(error)) => ui
+                    .uu_login_message
+                    .set(format!("打开登录项设置失败：{error}")),
+                Err(error) => ui
+                    .uu_login_message
+                    .set(format!("打开登录项设置任务失败：{error}")),
+            }
         });
     }
 
@@ -281,25 +406,29 @@ impl ProcessUi {
     }
 }
 
-impl SyncUi {
-    fn new() -> Self {
-        let current_user = env::var("USER").unwrap_or_else(|_| "g".to_string());
-        let ignore_patterns = sync::load_config()
-            .map(|config| config.ignore_patterns)
-            .unwrap_or_else(|_| sync::default_ignore_patterns())
-            .join("\n");
+impl SyncLaneUi {
+    fn new(
+        title: &'static str,
+        enabled: bool,
+        host: String,
+        remote_path: String,
+        local_path: String,
+        user: String,
+    ) -> Self {
         Self {
-            host: signal("192.168.32.6".to_string()),
-            user: signal(current_user),
+            title,
+            enabled: signal(enabled),
+            host: signal(host),
+            user: signal(user),
             port: signal("22".to_string()),
-            remote_path: signal("/Users/g/Desktop".to_string()),
-            local_path: signal("~/Desktop/来自-192.168.32.6".to_string()),
+            remote_path: signal(remote_path),
+            local_path: signal(local_path),
             jobs: signal("4".to_string()),
-            ignore_patterns: signal(ignore_patterns),
             delete_missing: signal(false),
-            status: signal("准备连接另一台 Mac。首次使用请先配置 SSH 免密登录。".to_string()),
+            status: signal("准备连接。首次使用请先配置 SSH 免密登录。".to_string()),
             detail: signal(
-                "首次同步走单路 tar 流；中断后自动补齐，完成后切换为增量 openrsync。".to_string(),
+                "首次同步走单路 tar 流；中断后继续 tar 镜像，完成后切换为多路增量 rsync。"
+                    .to_string(),
             ),
             progress: signal(0.0),
             processed: signal(0),
@@ -310,6 +439,7 @@ impl SyncUi {
             elapsed: signal("00:00".to_string()),
             heartbeat: signal("等待开始".to_string()),
             batch_summary: signal("尚未开始".to_string()),
+            command_preview: signal("# 填写连接参数后显示等效 rsync 命令".to_string()),
             running: signal(false),
             success: signal(false),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -317,7 +447,7 @@ impl SyncUi {
         }
     }
 
-    fn options(&self) -> Result<SyncOptions, String> {
+    fn options(&self, ignore_patterns: &[String]) -> Result<SyncOptions, String> {
         let port = self
             .port
             .get()
@@ -339,8 +469,17 @@ impl SyncUi {
             local_path: self.local_path.get(),
             jobs,
             delete_missing: self.delete_missing.get(),
-            ignore_patterns: sync::parse_ignore_patterns(&self.ignore_patterns.get()),
+            ignore_patterns: ignore_patterns.to_vec(),
         })
+    }
+
+    fn refresh_command_preview(&self, ignore_text: &str) {
+        let patterns = sync::parse_ignore_patterns(ignore_text);
+        let preview = self
+            .options(&patterns)
+            .and_then(|options| sync::rsync_command_preview(&options))
+            .unwrap_or_else(|error| format!("# 修正参数后显示命令：{error}"));
+        self.command_preview.set(preview);
     }
 
     fn reset_progress(&self) {
@@ -365,11 +504,11 @@ impl SyncUi {
         self.success.set(false);
     }
 
-    fn test_connection(&self) {
+    fn test_connection(&self, ignore_patterns: &[String]) {
         if self.running.get() {
             return;
         }
-        let options = match self.options() {
+        let options = match self.options(ignore_patterns) {
             Ok(options) => options,
             Err(error) => {
                 self.status.set(error);
@@ -387,11 +526,11 @@ impl SyncUi {
         self.pump_events(rx);
     }
 
-    fn start(&self) {
+    fn start(&self, ignore_patterns: &[String]) {
         if self.running.get() {
             return;
         }
-        let options = match self.options() {
+        let options = match self.options(ignore_patterns) {
             Ok(options) => options,
             Err(error) => {
                 self.status.set(error);
@@ -403,7 +542,7 @@ impl SyncUi {
         self.running.set(true);
         self.status.set("正在连接并建立远端文件索引…".to_string());
         self.detail.set(
-            "首次使用高速 tar 流；若中断，再次开始会校验并补齐已有内容，不从头重传。".to_string(),
+            "首次使用高速 tar 流；首次阶段中断后会继续 tar 镜像并保留已有文件，完成后再使用多路增量 rsync。".to_string(),
         );
         let (tx, rx) = mpsc::channel();
         let cancel = self.cancel.clone();
@@ -418,8 +557,8 @@ impl SyncUi {
         }
     }
 
-    fn prepare_access(&self) {
-        let options = match self.options() {
+    fn prepare_access(&self, ignore_patterns: &[String]) {
+        let options = match self.options(ignore_patterns) {
             Ok(options) => options,
             Err(error) => {
                 self.status.set(error);
@@ -430,48 +569,6 @@ impl SyncUi {
         match sync::prepare_ssh_access(&options) {
             Ok(message) => {
                 self.status.set(message);
-                self.success.set(true);
-            }
-            Err(error) => {
-                self.status.set(error);
-                self.success.set(false);
-            }
-        }
-    }
-
-    fn save_ignore_patterns(&self) {
-        if self.running.get() {
-            self.status
-                .set("同步进行中；忽略列表修改将在下次任务生效。".to_string());
-            return;
-        }
-        let patterns = sync::parse_ignore_patterns(&self.ignore_patterns.get());
-        let config = sync::SyncConfig {
-            ignore_patterns: patterns.clone(),
-        };
-        match sync::save_config(&config) {
-            Ok(()) => {
-                self.ignore_patterns.set(patterns.join("\n"));
-                self.status
-                    .set(format!("忽略列表已保存，共 {} 条规则。", patterns.len()));
-                self.success.set(true);
-            }
-            Err(error) => {
-                self.status.set(error);
-                self.success.set(false);
-            }
-        }
-    }
-
-    fn restore_default_ignores(&self) {
-        let patterns = sync::default_ignore_patterns();
-        self.ignore_patterns.set(patterns.join("\n"));
-        let config = sync::SyncConfig {
-            ignore_patterns: patterns,
-        };
-        match sync::save_config(&config) {
-            Ok(()) => {
-                self.status.set("已恢复内置忽略列表。".to_string());
                 self.success.set(true);
             }
             Err(error) => {
@@ -580,7 +677,464 @@ impl SyncUi {
     }
 }
 
-fn apply_sync_progress(ui: &SyncUi, progress: SyncProgress) {
+impl SyncUi {
+    fn new() -> Self {
+        let current_user = env::var("USER").unwrap_or_else(|_| "g".to_string());
+        let config = sync::load_config().unwrap_or_else(|_| sync::SyncConfig::default());
+        let ignore_patterns = if config.ignore_patterns.is_empty() {
+            sync::default_ignore_patterns()
+        } else {
+            config.ignore_patterns.clone()
+        };
+        let first = SyncLaneUi::new(
+            "设备 1",
+            true,
+            "192.168.2.2".to_string(),
+            "/Users/g/Desktop".to_string(),
+            "~/Desktop/来自-192.168.2.2".to_string(),
+            current_user.clone(),
+        );
+        let second = SyncLaneUi::new(
+            "设备 2",
+            false,
+            "192.168.2.50".to_string(),
+            "/Users/g/Desktop".to_string(),
+            "~/Desktop/来自-第二台-Mac".to_string(),
+            current_user,
+        );
+        if let Some(device) = config.devices.first() {
+            apply_sync_device_config(&first, device);
+            first.enabled.set(true);
+        }
+        if let Some(device) = config.devices.get(1) {
+            apply_sync_device_config(&second, device);
+        }
+        let ui = Self {
+            lanes: [first, second],
+            ignore_patterns: signal(ignore_patterns.join("\n")),
+            config_status: signal("两台设备可同时同步到不同本地文件夹。".to_string()),
+            config_success: signal(true),
+        };
+        ui.refresh_command_previews();
+        ui
+    }
+
+    fn patterns(&self) -> Vec<String> {
+        sync::parse_ignore_patterns(&self.ignore_patterns.get())
+    }
+
+    fn any_running(&self) -> bool {
+        self.lanes.iter().any(|lane| lane.running.get())
+    }
+
+    fn start_all(&self) {
+        let patterns = self.patterns();
+        let mut start_indices = Vec::new();
+        let mut active_options = Vec::new();
+        for (index, lane) in self.lanes.iter().enumerate() {
+            if !lane.enabled.get() || lane.running.get() {
+                continue;
+            }
+            match lane.options(&patterns) {
+                Ok(options) => {
+                    start_indices.push(index);
+                    active_options.push(options);
+                }
+                Err(error) => {
+                    lane.status.set(error);
+                    lane.success.set(false);
+                    self.config_status
+                        .set(format!("{} 的参数需要修正。", lane.title));
+                    self.config_success.set(false);
+                    return;
+                }
+            }
+        }
+        for lane in self.lanes.iter().filter(|lane| lane.running.get()) {
+            if let Ok(options) = lane.options(&patterns) {
+                active_options.push(options);
+            }
+        }
+        if let Err(error) = sync::validate_distinct_destinations(&active_options) {
+            self.config_status.set(error);
+            self.config_success.set(false);
+            return;
+        }
+        if start_indices.is_empty() {
+            self.config_status
+                .set("没有待启动的设备：已运行的设备会继续运行。".to_string());
+            self.config_success.set(false);
+            return;
+        }
+        self.save_devices();
+        for index in start_indices {
+            self.lanes[index].start(&patterns);
+        }
+        self.config_status.set(format!(
+            "已并行启动 {} 台设备；每台设备使用独立 SSH 会话。",
+            self.lanes.iter().filter(|lane| lane.running.get()).count()
+        ));
+        self.config_success.set(true);
+    }
+
+    fn stop_all(&self) {
+        for lane in &self.lanes {
+            lane.stop();
+        }
+        self.config_status
+            .set("已请求停止全部设备；已传输文件会保留。".to_string());
+    }
+
+    fn toggle_enabled(&self, index: usize) {
+        let Some(lane) = self.lanes.get(index) else {
+            return;
+        };
+        if lane.running.get() {
+            self.config_status
+                .set("设备正在同步，停止后才能修改启用状态。".to_string());
+            return;
+        }
+        lane.enabled.update(|enabled| *enabled = !*enabled);
+    }
+
+    fn start_lane(&self, index: usize) {
+        let Some(lane) = self.lanes.get(index) else {
+            return;
+        };
+        if lane.running.get() {
+            return;
+        }
+        let patterns = self.patterns();
+        let options = match lane.options(&patterns) {
+            Ok(options) => options,
+            Err(error) => {
+                lane.status.set(error);
+                lane.success.set(false);
+                return;
+            }
+        };
+        let mut active_options = vec![options];
+        for (other_index, other) in self.lanes.iter().enumerate() {
+            if other_index == index || !other.running.get() {
+                continue;
+            }
+            if let Ok(options) = other.options(&patterns) {
+                active_options.push(options);
+            }
+        }
+        if let Err(error) = sync::validate_distinct_destinations(&active_options) {
+            lane.status.set(error.clone());
+            lane.success.set(false);
+            self.config_status.set(error);
+            self.config_success.set(false);
+            return;
+        }
+        lane.enabled.set(true);
+        self.save_devices();
+        lane.start(&patterns);
+        self.config_status.set(format!("{} 已启动。", lane.title));
+        self.config_success.set(true);
+    }
+
+    fn stop_lane(&self, index: usize) {
+        if let Some(lane) = self.lanes.get(index) {
+            lane.stop();
+            self.config_status
+                .set(format!("已请求停止 {}。", lane.title));
+        }
+    }
+
+    fn test_connection(&self, index: usize) {
+        if let Some(lane) = self.lanes.get(index) {
+            lane.test_connection(&self.patterns());
+        }
+    }
+
+    fn prepare_access(&self, index: usize) {
+        if let Some(lane) = self.lanes.get(index) {
+            lane.prepare_access(&self.patterns());
+        }
+    }
+
+    fn refresh_command_previews(&self) {
+        let ignore_text = self.ignore_patterns.get();
+        for lane in &self.lanes {
+            lane.refresh_command_preview(&ignore_text);
+        }
+    }
+
+    fn save_devices(&self) {
+        let mut config = sync::load_config().unwrap_or_else(|_| sync::SyncConfig::default());
+        config.ignore_patterns = self.patterns();
+        config.devices = self.lanes.iter().map(sync_device_config).collect();
+        match sync::save_config(&config) {
+            Ok(()) => {
+                self.config_status
+                    .set("两台设备配置与忽略列表已保存。".to_string());
+                self.config_success.set(true);
+            }
+            Err(error) => {
+                self.config_status.set(error);
+                self.config_success.set(false);
+            }
+        }
+    }
+
+    fn save_ignore_patterns(&self) {
+        if self.any_running() {
+            self.config_status
+                .set("同步进行中；忽略列表修改将在下次任务生效。".to_string());
+            return;
+        }
+        let patterns = self.patterns();
+        self.ignore_patterns.set(patterns.join("\n"));
+        self.refresh_command_previews();
+        self.save_devices();
+    }
+
+    fn restore_default_ignores(&self) {
+        self.ignore_patterns
+            .set(sync::default_ignore_patterns().join("\n"));
+        self.refresh_command_previews();
+        self.save_devices();
+    }
+}
+
+impl BackgroundUi {
+    fn new() -> Self {
+        Self {
+            activities: signal(Vec::new()),
+            warning: signal(None),
+            status: signal("正在准备读取 macOS 后台 App 活动…".to_string()),
+            loading: signal(false),
+            query: signal(String::new()),
+            draft_name: signal(String::new()),
+            draft_target: signal(String::new()),
+            draft_arguments: signal(String::new()),
+            draft_enabled: signal(true),
+            draft_run_at_load: signal(true),
+            draft_keep_alive: signal(false),
+            editing_label: signal(None),
+        }
+    }
+
+    fn refresh(&self) {
+        if self.loading.get() {
+            return;
+        }
+        self.loading.set(true);
+        self.status
+            .set("正在读取 macOS 后台 App 活动与实际运行状态…".to_string());
+        let ui = self.clone();
+        spawn(async move {
+            match blocking(background::scan_activities).await {
+                Ok(scan) => {
+                    let count = scan.activities.len();
+                    ui.activities.set(scan.activities);
+                    ui.warning.set(scan.warning);
+                    ui.status
+                        .set(format!("已读取 {count} 个后台 App 活动项目。"));
+                }
+                Err(error) => {
+                    ui.warning
+                        .set(Some(format!("读取后台活动失败：{error}")));
+                    ui.status.set("刷新失败，请稍后重试。".to_string());
+                }
+            }
+            ui.loading.set(false);
+        });
+    }
+
+    fn begin_new(&self) {
+        self.editing_label.set(None);
+        self.draft_name.set(String::new());
+        self.draft_target.set(String::new());
+        self.draft_arguments.set(String::new());
+        self.draft_enabled.set(true);
+        self.draft_run_at_load.set(true);
+        self.draft_keep_alive.set(false);
+    }
+
+    fn begin_edit(&self, activity: &BackgroundActivity) {
+        let Some(label) = activity.launch_label.as_deref().filter(|_| activity.managed) else {
+            self.status
+                .set("系统项目不可直接编辑；可打开登录项设置查看。".to_string());
+            return;
+        };
+        match background::load_managed_activities() {
+            Ok(activities) => match activities.iter().find(|item| item.label == label) {
+                Some(item) => {
+                    self.editing_label.set(Some(item.label.clone()));
+                    self.draft_name.set(item.name.clone());
+                    self.draft_target.set(item.target.clone());
+                    self.draft_arguments.set(item.arguments.join(", "));
+                    self.draft_enabled.set(item.enabled);
+                    self.draft_run_at_load.set(item.run_at_load);
+                    self.draft_keep_alive.set(item.keep_alive);
+                    self.status
+                        .set(format!("正在编辑“{}”。", item.name));
+                }
+                None => self
+                    .status
+                    .set("未找到该自定义后台活动的配置。".to_string()),
+            },
+            Err(error) => self.status.set(error),
+        }
+    }
+
+    fn save(&self) {
+        let editing = self.editing_label.get();
+        let was_editing = editing.is_some();
+        let name = self.draft_name.get();
+        let target = self.draft_target.get();
+        let arguments = parse_background_arguments(&self.draft_arguments.get());
+        let enabled = self.draft_enabled.get();
+        let run_at_load = self.draft_run_at_load.get();
+        let keep_alive = self.draft_keep_alive.get();
+        self.status
+            .set("正在写入 LaunchAgent 并更新后台活动…".to_string());
+        let ui = self.clone();
+        spawn(async move {
+            let result = blocking(move || match editing.as_deref() {
+                Some(label) => background::update_activity(
+                    label,
+                    &name,
+                    &target,
+                    arguments,
+                    enabled,
+                    run_at_load,
+                    keep_alive,
+                )
+                .map(|_| ()),
+                None => background::create_activity(
+                    &name,
+                    &target,
+                    arguments,
+                    enabled,
+                    run_at_load,
+                    keep_alive,
+                )
+                .map(|_| ()),
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => {
+                    ui.begin_new();
+                    ui.status.set(if was_editing {
+                        "后台活动修改已保存。".to_string()
+                    } else {
+                        "后台活动已新增并登记到 LaunchAgents。".to_string()
+                    });
+                    ui.refresh();
+                }
+                Ok(Err(error)) => ui.status.set(error),
+                Err(error) => ui.status.set(format!("保存后台活动任务失败：{error}")),
+            }
+        });
+    }
+
+    fn toggle(&self, activity: &BackgroundActivity, enabled: bool) {
+        let activity = activity.clone();
+        self.status.set(format!(
+            "正在{}“{}”…",
+            if enabled { "启用" } else { "关闭" },
+            activity.name
+        ));
+        let ui = self.clone();
+        spawn(async move {
+            let result =
+                blocking(move || background::set_enabled(&activity, enabled)).await;
+            match result {
+                Ok(Ok(())) => {
+                    ui.status.set(format!(
+                        "“{}”已{}。",
+                        activity.name,
+                        if enabled { "启用" } else { "关闭" }
+                    ));
+                    ui.refresh();
+                }
+                Ok(Err(error)) => ui.status.set(error),
+                Err(error) => ui.status.set(format!("切换后台活动失败：{error}")),
+            }
+        });
+    }
+
+    fn delete(&self, activity: &BackgroundActivity) {
+        let Some(label) = activity.launch_label.clone().filter(|_| activity.managed) else {
+            self.status
+                .set("系统项目不能从这里删除；自定义活动才可以删除。".to_string());
+            return;
+        };
+        let name = activity.name.clone();
+        let ui = self.clone();
+        spawn(async move {
+            let result =
+                blocking(move || background::delete_activity(&label)).await;
+            match result {
+                Ok(Ok(())) => {
+                    if ui
+                        .editing_label
+                        .get()
+                        .as_deref()
+                        .is_some_and(|editing| editing == activity.id)
+                    {
+                        ui.begin_new();
+                    }
+                    ui.status.set(format!("“{name}”已删除。"));
+                    ui.refresh();
+                }
+                Ok(Err(error)) => ui.status.set(error),
+                Err(error) => ui.status.set(format!("删除后台活动失败：{error}")),
+            }
+        });
+    }
+
+    fn open_settings(&self, note: &'static str) {
+        let ui = self.clone();
+        spawn(async move {
+            match blocking(background::open_login_items_settings).await {
+                Ok(Ok(())) => ui.status.set(note.to_string()),
+                Ok(Err(error)) => ui.status.set(format!("打开登录项设置失败：{error}")),
+                Err(error) => ui.status.set(format!("打开登录项设置任务失败：{error}")),
+            }
+        });
+    }
+}
+
+fn parse_background_arguments(value: &str) -> Vec<String> {
+    value
+        .split([',', '，', '\n'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn apply_sync_device_config(lane: &SyncLaneUi, config: &sync::SyncDeviceConfig) {
+    lane.host.set(config.host.clone());
+    lane.user.set(config.user.clone());
+    lane.port.set(config.port.clone());
+    lane.remote_path.set(config.remote_path.clone());
+    lane.local_path.set(config.local_path.clone());
+    lane.jobs.set(config.jobs.clone());
+    lane.delete_missing.set(config.delete_missing);
+    lane.enabled.set(config.enabled);
+}
+
+fn sync_device_config(lane: &SyncLaneUi) -> sync::SyncDeviceConfig {
+    sync::SyncDeviceConfig {
+        enabled: lane.enabled.get(),
+        host: lane.host.get(),
+        user: lane.user.get(),
+        port: lane.port.get(),
+        remote_path: lane.remote_path.get(),
+        local_path: lane.local_path.get(),
+        jobs: lane.jobs.get(),
+        delete_missing: lane.delete_missing.get(),
+    }
+}
+
+fn apply_sync_progress(ui: &SyncLaneUi, progress: SyncProgress) {
     if let Ok(mut runtime) = ui.runtime.lock() {
         let now = Instant::now();
         runtime.started_at.get_or_insert(now);
@@ -793,13 +1347,51 @@ fn field(label: &'static str, value: Signal<String>) -> View {
         )
 }
 
-fn text_area(value: Signal<String>, height: f32) -> View {
+fn sync_field(
+    label: &'static str,
+    value: Signal<String>,
+    lane: SyncLaneUi,
+    patterns: Signal<String>,
+) -> View {
+    view()
+        .flex_1()
+        .gap_1()
+        .child(
+            text(label)
+                .text_size(px(12.0))
+                .text_color(move || theme().muted_foreground),
+        )
+        .child(
+            input()
+                .value(move || value.get())
+                .on_change(move |next: &str| {
+                    value.set(next.to_owned());
+                    lane.refresh_command_preview(&patterns.get());
+                })
+                .h(px(40.0))
+                .px_3()
+                .rounded_md()
+                .border_1()
+                .border_color(move || theme().border)
+                .bg(move || theme().background),
+        )
+}
+
+fn sync_ignore_text_area(ui: SyncUi) -> View {
+    let patterns = ui.ignore_patterns;
+    let lanes = ui.lanes;
     view().w_full().child(
         input()
             .multiline(true)
-            .value(move || value.get())
-            .on_change(move |next: &str| value.set(next.to_owned()))
-            .h(px(height))
+            .value(move || patterns.get())
+            .on_change(move |next: &str| {
+                patterns.set(next.to_owned());
+                let ignore_text = patterns.get();
+                for lane in &lanes {
+                    lane.refresh_command_preview(&ignore_text);
+                }
+            })
+            .h(px(150.0))
             .p_3()
             .rounded_md()
             .border_1()
@@ -1650,7 +2242,7 @@ pub fn App() -> impl IntoElement {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(TAB_ALL)
-        .min(TAB_SYNC);
+        .min(TAB_BACKGROUND);
     let tab = signal(initial_tab);
     let tasks = signal(initial_tasks());
     let install_running = signal(false);
@@ -1705,8 +2297,11 @@ pub fn App() -> impl IntoElement {
     let actions = make_actions(state);
     preflight_installed_tasks(state);
     let process_ui = ProcessUi::new();
+    process_ui.refresh_uu_login_item();
     process_ui.start_monitor();
     let sync_ui = SyncUi::new();
+    let background_ui = BackgroundUi::new();
+    background_ui.refresh();
 
     spawn(async move {
         match blocking(display::detect).await {
@@ -1787,12 +2382,14 @@ pub fn App() -> impl IntoElement {
     let actions_for_pages = actions.clone();
     let process_pages = process_ui.clone();
     let sync_pages = sync_ui.clone();
+    let background_pages = background_ui.clone();
     let pages = dynamic(move || match state_for_pages.tab.get() {
         TAB_DISPLAY => display_page(state_for_pages, &actions_for_pages),
         TAB_SYSTEM => system_page(state_for_pages, &actions_for_pages),
         TAB_AUTO_START => auto_start_page(state_for_pages, process_pages.clone()),
         TAB_AUTO_CLEAN => auto_clean_page(state_for_pages, process_pages.clone()),
         TAB_SYNC => sync_page(sync_pages.clone()),
+        TAB_BACKGROUND => background_page(background_pages.clone()),
         _ => all_page(state_for_pages, &actions_for_pages),
     });
 
@@ -1821,7 +2418,7 @@ pub fn App() -> impl IntoElement {
                         .font_weight(FontWeight::BOLD),
                 )
                 .child(
-                    text("系统代理 · PATH · 显示器修复 · 跨 Mac 文件同步 · 实时进度")
+                    text("系统代理 · PATH · 显示器修复 · 跨 Mac 文件同步 · 后台 App 活动")
                         .text_size(px(13.0))
                         .text_color(move || theme().muted_foreground),
                 ),
@@ -1841,27 +2438,23 @@ pub fn App() -> impl IntoElement {
                 .child(tab_button("系统设置", TAB_SYSTEM, state))
                 .child(tab_button("自动启动进程", TAB_AUTO_START, state))
                 .child(tab_button("自动清理", TAB_AUTO_CLEAN, state))
-                .child(tab_button("文件同步", TAB_SYNC, state)),
+                .child(tab_button("文件同步", TAB_SYNC, state))
+                .child(tab_button("后台 App 活动", TAB_BACKGROUND, state)),
         )
         .child(pages)
 }
 
 fn sync_page(ui: SyncUi) -> AnyElement {
-    let running = ui.running.get();
-    let delete_missing = ui.delete_missing.get();
-    let check_ui = ui.clone();
-    let start_ui = ui.clone();
-    let stop_ui = ui.clone();
-    let access_ui = ui.clone();
-    let toggle_ui = ui.clone();
-    let status_ui = ui.clone();
-    let progress_color_ui = ui.clone();
-    let progress_text_ui = ui.clone();
-    let progress_bar_ui = ui.clone();
+    let running = ui.any_running();
+    let start_all_ui = ui.clone();
+    let stop_all_ui = ui.clone();
+    let save_ui = ui.clone();
     let ignore_save_ui = ui.clone();
     let ignore_default_ui = ui.clone();
-    let status_color = move || {
-        if status_ui.success.get() {
+    let config_status_ui = ui.clone();
+    let config_color_ui = ui.clone();
+    let config_color = move || {
+        if config_color_ui.config_success.get() {
             theme().chart_1
         } else {
             theme().foreground
@@ -1877,117 +2470,58 @@ fn sync_page(ui: SyncUi) -> AnyElement {
                     .font_weight(FontWeight::BOLD),
             )
             .child(
-                text("首次高速 tar 流 · 后续多路增量同步 · 实时字节进度 · SSH 传输")
+                text("两台 Mac 可并行同步 · 首次 tar 流 · 后续多路 rsync · 实时字节进度")
                     .text_size(px(13.0))
                     .text_color(move || theme().muted_foreground),
             )
             .child(
-                muted_card()
+                card()
                     .child(
                         view()
                             .flex_row()
-                            .gap_3()
+                            .justify_between()
                             .items_center()
                             .child(
-                                text("智能后端")
-                                    .text_size(px(12.0))
-                                    .font_weight(FontWeight::SEMIBOLD),
+                                section_title(
+                                    "双设备并行同步",
+                                    "可同时连接两台 Mac；每台设备独立设置端口、路径、并发数和进度。",
+                                ),
                             )
                             .child(
-                                text("tar 流 + openrsync")
-                                    .text_size(px(12.0))
-                                    .font_family("Menlo"),
-                            )
-                            .child(
-                                text("首次 1 路 · 增量默认 4 路")
+                                text(if running { "至少一台正在同步" } else { "等待开始" })
                                     .text_size(px(12.0))
                                     .text_color(move || theme().muted_foreground),
                             ),
                     )
                     .child(
-                        text(
-                            "2 万个远端空文件实测：首次 tar 流 1.10 秒，4 路 openrsync 2.53 秒，parsync 8 路 127 秒仍只有 8,071 个。首次镜像用 tar 流，完成后建立状态标记并自动切换增量 openrsync；目录不再逐个串行预建。",
-                        )
-                        .text_size(px(12.0))
-                        .text_color(move || theme().muted_foreground),
-                    )
-                    .child(
-                        text(
-                            "进一步实测 SFTP/SSH：2 万个 4 KiB 文件用 tar 4.45 秒、msy 99.35 秒；rclone 在 1,000 文件用 17.79 秒，rsy 97 秒仍写入 0 个。它们不进入默认流程，避免额外依赖和不稳定协议。",
-                        )
-                        .text_size(px(12.0))
-                        .text_color(move || theme().muted_foreground),
-                    ),
-            )
-            .child(
-                card()
-                    .child(section_title(
-                        "远端 Mac",
-                        "默认连接 192.168.32.6 的 /Users/g/Desktop。支持 SSH config 别名和自定义端口。",
-                    ))
-                    .child(
-                        view()
-                            .flex_row()
-                            .gap_3()
-                            .child(field("主机名或 IP", ui.host))
-                            .child(field("SSH 用户名", ui.user))
-                            .child(field("SSH 端口", ui.port)),
-                    )
-                    .child(
-                        view()
-                            .flex_row()
-                            .gap_3()
-                            .child(field("远端文件夹", ui.remote_path))
-                            .child(field("本地目标文件夹", ui.local_path)),
-                    )
-                    .child(
-                        view()
-                            .flex_row()
-                            .gap_3()
-                            .child(field("增量 openrsync 数量（1–8）", ui.jobs))
-                            .child(action_button(
-                                if delete_missing {
-                                    "删除本地多余文件：已开启"
-                                } else {
-                                    "删除本地多余文件：已关闭"
-                                },
-                                false,
-                                move || {
-                                    toggle_ui
-                                        .delete_missing
-                                        .update(|enabled| *enabled = !*enabled);
-                                },
-                            )),
-                    )
-                    .child(
                         view()
                             .flex_row()
                             .gap_2()
-                            .child(action_button("配置免密登录", false, move || {
-                                access_ui.prepare_access();
+                            .child(action_button("同步全部启用设备", true, move || {
+                                start_all_ui.start_all();
                             }))
-                            .child(action_button("检测连接", false, move || {
-                                check_ui.test_connection();
+                            .child(action_button("停止全部", false, move || {
+                                stop_all_ui.stop_all();
                             }))
-                            .child(action_button(
-                                if running {
-                                    "同步进行中…"
-                                } else {
-                                    "开始智能同步"
-                                },
-                                true,
-                                move || start_ui.start(),
-                            ))
-                            .child(action_button("停止", false, move || stop_ui.stop())),
+                            .child(action_button("保存两台设备配置", false, move || {
+                                save_ui.save_devices();
+                            })),
+                    )
+                    .child(
+                        text(move || config_status_ui.config_status.get())
+                            .text_size(px(12.0))
+                            .text_color(config_color),
                     ),
             )
+            .child(sync_device_card(ui.clone(), 0))
+            .child(sync_device_card(ui.clone(), 1))
             .child(
                 card()
                     .child(section_title(
                         "忽略列表",
                         "每行一条，支持 * 和 ?，以 # 开头为注释；目录规则会同时排除其内容。",
                     ))
-                    .child(text_area(ui.ignore_patterns, 150.0))
+                    .child(sync_ignore_text_area(ui.clone()))
                     .child(
                         view()
                             .flex_row()
@@ -2012,108 +2546,290 @@ fn sync_page(ui: SyncUi) -> AnyElement {
                     ),
             )
             .child(
-                card()
-                    .child(
-                        view()
-                            .flex_row()
-                            .justify_between()
-                            .items_center()
-                            .child(
-                                text(move || ui.status.get())
-                                    .text_size(px(14.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(status_color),
-                            )
-                            .child(
-                                text(move || {
-                                    format_percent(progress_text_ui.progress.get())
-                                })
-                                    .text_size(px(14.0))
-                                    .font_weight(FontWeight::BOLD),
-                            ),
-                    )
-                    .child(
-                        view()
-                            .w(px(780.0))
-                            .h(px(10.0))
-                            .rounded_full()
-                            .overflow_hidden()
-                            .bg(move || theme().muted)
-                            .child(
-                                view()
-                                    .h_full()
-                                    .w(move || {
-                                        px(progress_bar_ui.progress.get() / 100.0 * 780.0)
-                                    })
-                                    .rounded_full()
-                                    .bg(move || {
-                                        if progress_color_ui.success.get() {
-                                            theme().chart_1
-                                        } else {
-                                            theme().primary
-                                        }
-                                    }),
-                            ),
-                    )
-                    .child(
-                        text(move || ui.detail.get())
-                            .text_size(px(12.0))
-                            .text_color(move || theme().muted_foreground),
-                    )
-                    .child(
-                        text(move || ui.heartbeat.get())
-                            .text_size(px(11.0))
-                            .text_color(move || theme().muted_foreground),
-                    )
-                    .child(
-                        view()
-                            .flex_row()
-                            .gap_4()
-                            .child(sync_stat("文件", move || {
-                                format!("{} / {}", ui.processed.get(), ui.total_files.get())
-                            }))
-                            .child(sync_stat("数据", move || {
-                                format!(
-                                    "{} / {}",
-                                    format_bytes(ui.completed_bytes.get()),
-                                    format_bytes(ui.total_bytes.get())
-                                )
-                            }))
-                            .child(sync_stat("速度", move || ui.rate.get()))
-                            .child(sync_stat("耗时", move || ui.elapsed.get()))
-                            .child(sync_stat("并行状态", move || ui.batch_summary.get())),
-                    ),
-            )
-            .child(
                 muted_card()
                     .child(
-                        text("为什么这样选")
+                        text("为什么首次用 tar，后续用多路 rsync")
                             .text_size(px(13.0))
                             .font_weight(FontWeight::SEMIBOLD),
                     )
                     .child(
                         text(
-                            "首次 tar 传输前会保存未完成状态；若中途断开，再次开始会用 openrsync 校验并补齐已完成内容，全部成功后才写入完成标记。后续按路径连续切分文件与空目录，减少远端目录反复遍历，并用非目录 XFER 事件修正进度计数。",
+                            "20,000 个小文件实测：首次 tar 流 1.10 秒，4 路系统 rsync 2.53 秒，差距约 2.3 倍，因此首次仍保留 tar 流。首次中断会继续 tar 镜像，不重新扫描 121 万文件。",
                         )
                         .text_size(px(12.0))
                         .text_color(move || theme().muted_foreground),
                     )
                     .child(
                         text(
-                            "增量任务使用动态工作队列：并发数固定，但准备多于并发的连续区块，完成快的线程会立即领取下一块，减少尾部只剩一路的情况。网络中断会按 2、4、8、16、30 秒退避自动重连；权限不足、文件消失和路径过长会作为警告跳过。",
+                            "首次完成后，后续变化统一使用系统 /usr/bin/rsync 的多路增量队列，不再有单独扩展实现或额外依赖。网络中断会按 2、4、8、16、30 秒退避自动重连。",
                         )
                         .text_size(px(12.0))
                         .text_color(move || theme().muted_foreground),
                     )
                     .child(
                         text(
-                            "fast_rsync 0.2.0 实测算术很快：4 MiB 签名约 1.9 ms、64 KiB 修改差分约 3.1 ms；但它只是差分算法库，没有 SSH、遍历、断点或接收协议，不能直接替代 openrsync。它适合未来给超大单文件做按块增量，不适合当前 122 万小文件的完整同步。",
+                            "两台设备写入相同本地目录会被拒绝，避免两个 rsync 同时覆盖同一批文件。命令预览使用表单的当前值，修改主机、端口、路径、忽略列表或删除开关后会立即刷新。",
                         )
                         .text_size(px(12.0))
                         .text_color(move || theme().muted_foreground),
                     ),
             ),
     )
+}
+
+fn sync_device_card(ui: SyncUi, index: usize) -> View {
+    let lane = ui.lanes[index].clone();
+    let patterns_signal = ui.ignore_patterns;
+    let enabled = lane.enabled.get();
+    let running = lane.running.get();
+    let delete_missing = lane.delete_missing.get();
+    let toggle_ui = ui.clone();
+    let access_ui = ui.clone();
+    let check_ui = ui.clone();
+    let start_ui = ui.clone();
+    let stop_ui = ui.clone();
+    let delete_ui = lane.clone();
+    let delete_patterns_ui = patterns_signal;
+    let status_ui = lane.clone();
+    let progress_ui = lane.clone();
+    let detail_ui = lane.clone();
+    let heartbeat_ui = lane.clone();
+    let files_ui = lane.clone();
+    let bytes_ui = lane.clone();
+    let rate_ui = lane.clone();
+    let elapsed_ui = lane.clone();
+    let batches_ui = lane.clone();
+    let progress_bar_ui = lane.clone();
+    let progress_color_ui = lane.clone();
+    let command_ui = ui.clone();
+    let status_color = move || {
+        if status_ui.success.get() {
+            theme().chart_1
+        } else {
+            theme().foreground
+        }
+    };
+
+    card()
+        .child(
+            view()
+                .flex_row()
+                .justify_between()
+                .items_center()
+                .child(
+                    view()
+                        .gap_1()
+                        .child(
+                            text(lane.title)
+                                .text_size(px(17.0))
+                                .font_weight(FontWeight::SEMIBOLD),
+                        )
+                        .child(
+                            text("独立 SSH 会话 · 独立本地目标 · 独立进度")
+                                .text_size(px(12.0))
+                                .text_color(move || theme().muted_foreground),
+                        ),
+                )
+                .child(action_button(
+                    if enabled {
+                        "设备已启用"
+                    } else {
+                        "设备未启用"
+                    },
+                    enabled,
+                    move || toggle_ui.toggle_enabled(index),
+                )),
+        )
+        .child(
+            view()
+                .flex_row()
+                .gap_3()
+                .child(sync_field(
+                    "主机名或 IP",
+                    lane.host,
+                    lane.clone(),
+                    patterns_signal,
+                ))
+                .child(sync_field(
+                    "SSH 用户名",
+                    lane.user,
+                    lane.clone(),
+                    patterns_signal,
+                ))
+                .child(sync_field(
+                    "SSH 端口",
+                    lane.port,
+                    lane.clone(),
+                    patterns_signal,
+                )),
+        )
+        .child(
+            view()
+                .flex_row()
+                .gap_3()
+                .child(sync_field(
+                    "远端文件夹",
+                    lane.remote_path,
+                    lane.clone(),
+                    patterns_signal,
+                ))
+                .child(sync_field(
+                    "本地目标文件夹（两台必须不同）",
+                    lane.local_path,
+                    lane.clone(),
+                    patterns_signal,
+                )),
+        )
+        .child(
+            view()
+                .flex_row()
+                .gap_3()
+                .child(sync_field(
+                    "增量 rsync 数量（1–8）",
+                    lane.jobs,
+                    lane.clone(),
+                    patterns_signal,
+                ))
+                .child(action_button(
+                    if delete_missing {
+                        "删除本地多余文件：已开启"
+                    } else {
+                        "删除本地多余文件：已关闭"
+                    },
+                    false,
+                    move || {
+                        delete_ui
+                            .delete_missing
+                            .update(|enabled| *enabled = !*enabled);
+                        delete_ui.refresh_command_preview(&delete_patterns_ui.get());
+                    },
+                )),
+        )
+        .child(
+            view()
+                .flex_row()
+                .gap_2()
+                .child(action_button("配置免密登录", false, move || {
+                    access_ui.prepare_access(index);
+                }))
+                .child(action_button("检测连接", false, move || {
+                    check_ui.test_connection(index);
+                }))
+                .child(action_button(
+                    if running {
+                        "此设备正在同步…"
+                    } else {
+                        "开始此设备"
+                    },
+                    true,
+                    move || start_ui.start_lane(index),
+                ))
+                .child(action_button("停止此设备", false, move || {
+                    stop_ui.stop_lane(index);
+                })),
+        )
+        .child(
+            muted_card()
+                .child(
+                    view()
+                        .flex_row()
+                        .justify_between()
+                        .items_center()
+                        .child(
+                            text(move || status_ui.status.get())
+                                .text_size(px(14.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(status_color),
+                        )
+                        .child(
+                            text(move || format_percent(progress_ui.progress.get()))
+                                .text_size(px(14.0))
+                                .font_weight(FontWeight::BOLD),
+                        ),
+                )
+                .child(
+                    view()
+                        .w(px(740.0))
+                        .h(px(9.0))
+                        .rounded_full()
+                        .overflow_hidden()
+                        .bg(move || theme().border)
+                        .child(
+                            view()
+                                .h_full()
+                                .w(move || px(progress_bar_ui.progress.get() / 100.0 * 740.0))
+                                .rounded_full()
+                                .bg(move || {
+                                    if progress_color_ui.success.get() {
+                                        theme().chart_1
+                                    } else {
+                                        theme().primary
+                                    }
+                                }),
+                        ),
+                )
+                .child(
+                    text(move || detail_ui.detail.get())
+                        .text_size(px(12.0))
+                        .text_color(move || theme().muted_foreground),
+                )
+                .child(
+                    text(move || heartbeat_ui.heartbeat.get())
+                        .text_size(px(11.0))
+                        .text_color(move || theme().muted_foreground),
+                )
+                .child(
+                    view()
+                        .flex_row()
+                        .gap_4()
+                        .child(sync_stat("文件", move || {
+                            format!(
+                                "{} / {}",
+                                files_ui.processed.get(),
+                                files_ui.total_files.get()
+                            )
+                        }))
+                        .child(sync_stat("数据", move || {
+                            format!(
+                                "{} / {}",
+                                format_bytes(bytes_ui.completed_bytes.get()),
+                                format_bytes(bytes_ui.total_bytes.get())
+                            )
+                        }))
+                        .child(sync_stat("速度", move || rate_ui.rate.get()))
+                        .child(sync_stat("耗时", move || elapsed_ui.elapsed.get()))
+                        .child(sync_stat("并行状态", move || {
+                            batches_ui.batch_summary.get()
+                        })),
+                ),
+        )
+        .child(
+            muted_card()
+                .child(
+                    text("等效 rsync 调试命令（表单修改后实时更新）")
+                        .text_size(px(12.0))
+                        .font_weight(FontWeight::SEMIBOLD),
+                )
+                .child(
+                    text("这是单路等效命令；应用会按并发数把文件清单拆成多个工作单元。")
+                        .text_size(px(11.0))
+                        .text_color(move || theme().muted_foreground),
+                )
+                .child(
+                    input()
+                        .readonly(true)
+                        .multiline(true)
+                        .value(move || command_ui.lanes[index].command_preview.get())
+                        .h(px(92.0))
+                        .p_3()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(move || theme().border)
+                        .bg(move || theme().background)
+                        .font_family("Menlo")
+                        .text_size(px(11.0)),
+                ),
+        )
 }
 
 fn sync_stat(label: &'static str, value: impl Fn() -> String + 'static) -> View {
@@ -2538,6 +3254,70 @@ fn auto_start_page(_state: UiState, ui: ProcessUi) -> AnyElement {
     let enabled = ui.monitor_enabled.get();
     let toggle_ui = ui.clone();
     let add_ui = ui.clone();
+    let check_login_ui = ui.clone();
+    let repair_login_ui = ui.clone();
+    let open_login_ui = ui.clone();
+    let login_status = ui.uu_login_status.get();
+    let login_ready = login_status
+        .as_ref()
+        .is_some_and(|status| status.is_ready());
+    let login_disabled = login_status
+        .as_ref()
+        .is_some_and(|status| status.background_item_enabled == Some(false));
+    let login_badge = if ui.uu_login_working.get() {
+        "检测中"
+    } else if login_ready {
+        "已加入并启用"
+    } else if login_disabled {
+        "已加入但关闭"
+    } else {
+        "需要检查"
+    };
+    let mut login_rows = Vec::new();
+    if let Some(status) = login_status.as_ref() {
+        login_rows.push(process_status_row(
+            "UU远程应用",
+            if status.app_installed {
+                "已安装"
+            } else {
+                "未安装"
+            },
+            status.app_installed,
+        ));
+        login_rows.push(process_status_row(
+            "后台登录项",
+            if status.login_item_installed {
+                "已加入 ~/Library/LaunchAgents"
+            } else {
+                "未加入"
+            },
+            status.login_item_installed,
+        ));
+        login_rows.push(process_status_row(
+            "系统设置列表",
+            if status.background_item_registered {
+                if status.background_item_enabled == Some(false) {
+                    "已显示 · 已关闭"
+                } else {
+                    "已显示 · 已启用"
+                }
+            } else {
+                "未显示"
+            },
+            status.background_item_registered && status.background_item_enabled != Some(false),
+        ));
+        login_rows.push(process_status_row(
+            "后台服务",
+            if status.agent_running {
+                "正在运行"
+            } else if status.launchd_loaded {
+                "已载入 · 未运行"
+            } else {
+                "未载入"
+            },
+            status.agent_running,
+        ));
+    }
 
     let monitor_rows = monitors.into_iter().map(|monitor| {
         let remove_ui = ui.clone();
@@ -2621,6 +3401,81 @@ fn auto_start_page(_state: UiState, ui: ProcessUi) -> AnyElement {
                             .justify_between()
                             .items_center()
                             .child(section_title(
+                                "UU远程后台登录项",
+                                "对应 系统设置 → 通用 → 登录项与扩展 → 后台 App 活动；服务标识 com.netease.uuremote.agent。",
+                            ))
+                            .child(
+                                text(login_badge)
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_full()
+                                    .bg(move || {
+                                        if login_ready {
+                                            theme().primary
+                                        } else {
+                                            theme().muted
+                                        }
+                                    })
+                                    .text_size(px(10.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(move || {
+                                        if login_ready {
+                                            theme().primary_foreground
+                                        } else {
+                                            theme().muted_foreground
+                                        }
+                                    }),
+                            ),
+                    )
+                    .children(login_rows)
+                    .child(
+                        muted_card().child(
+                            text(move || ui.uu_login_message.get())
+                                .text_size(px(12.0))
+                                .text_color(move || {
+                                    if ui.uu_login_status
+                                        .get()
+                                        .as_ref()
+                                        .is_some_and(|status| status.is_ready())
+                                    {
+                                        theme().foreground
+                                    } else {
+                                        theme().destructive
+                                    }
+                                }),
+                        ),
+                    )
+                    .child(
+                        view()
+                            .flex_row()
+                            .gap_2()
+                            .child(action_button(
+                                if ui.uu_login_working.get() {
+                                    "检测中…"
+                                } else {
+                                    "检测登录项"
+                                },
+                                false,
+                                move || check_login_ui.refresh_uu_login_item(),
+                            ))
+                            .child(action_button(
+                                "自动加入并启用",
+                                true,
+                                move || repair_login_ui.ensure_uu_login_item(),
+                            ))
+                            .child(action_button("打开登录项设置", false, move || {
+                                open_login_ui.open_uu_login_settings()
+                            })),
+                    ),
+            )
+            .child(
+                card()
+                    .child(
+                        view()
+                            .flex_row()
+                            .justify_between()
+                            .items_center()
+                            .child(section_title(
                                 "监视应用",
                                 "默认监视 /Applications/UURemote.app；进程缺失后自动启动。",
                             ))
@@ -2670,6 +3525,31 @@ fn auto_start_page(_state: UiState, ui: ProcessUi) -> AnyElement {
                 ),
             ),
     )
+}
+
+fn process_status_row(label: &'static str, value: &'static str, healthy: bool) -> View {
+    view()
+        .flex_row()
+        .justify_between()
+        .items_center()
+        .py_1()
+        .child(
+            text(label)
+                .text_size(px(12.0))
+                .text_color(move || theme().muted_foreground),
+        )
+        .child(
+            text(value)
+                .text_size(px(12.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(move || {
+                    if healthy {
+                        theme().primary
+                    } else {
+                        theme().destructive
+                    }
+                }),
+        )
 }
 
 fn auto_clean_page(_state: UiState, ui: ProcessUi) -> AnyElement {

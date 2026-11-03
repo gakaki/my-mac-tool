@@ -40,6 +40,14 @@ done
 cp "$icon_png" "$iconset/icon_512x512@2x.png"
 iconutil -c icns "$iconset" -o "$app_dir/Contents/Resources/AppIcon.icns"
 
+qlmanage -t -s 72 -o "$icon_work" "$project_dir/packaging/MenuBarIcon.svg" >/dev/null 2>&1
+menu_bar_icon="$icon_work/MenuBarIcon.svg.png"
+if [[ ! -f "$menu_bar_icon" ]]; then
+  echo "failed to render MenuBarIcon.svg" >&2
+  exit 1
+fi
+sips -z 36 36 "$menu_bar_icon" --out "$app_dir/Contents/Resources/MenuBarIcon.png" >/dev/null
+
 plutil -lint "$app_dir/Contents/Info.plist"
 codesign --force --deep --sign - "$app_dir"
 

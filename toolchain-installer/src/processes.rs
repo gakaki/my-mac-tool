@@ -110,6 +110,180 @@ pub struct MonitorRuntime {
     apps: HashMap<String, AppRuntime>,
 }
 
+pub const UU_REMOTE_APP_PATH: &str = "/Applications/UURemote.app";
+pub const UU_REMOTE_LOGIN_LABEL: &str = "com.netease.uuremote.agent";
+const UU_REMOTE_AGENT_SOURCE: &str =
+    "/Applications/UURemote.app/Contents/Resources/com.netease.uuremote.agent.plist";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UuRemoteLoginStatus {
+    pub app_installed: bool,
+    pub bundled_agent_available: bool,
+    pub login_item_installed: bool,
+    pub launchd_loaded: bool,
+    pub launchd_enabled: bool,
+    pub agent_running: bool,
+    pub background_item_registered: bool,
+    pub background_item_enabled: Option<bool>,
+}
+
+impl UuRemoteLoginStatus {
+    pub fn is_ready(&self) -> bool {
+        self.app_installed
+            && self.bundled_agent_available
+            && self.login_item_installed
+            && self.launchd_loaded
+            && self.launchd_enabled
+            && self.agent_running
+            && self.background_item_registered
+            && self.background_item_enabled != Some(false)
+    }
+}
+
+fn uu_remote_login_item_path() -> Result<PathBuf, String> {
+    let home = env::var_os("HOME").ok_or_else(|| "无法确定用户目录".to_string())?;
+    Ok(PathBuf::from(home)
+        .join("Library/LaunchAgents")
+        .join("com.netease.uuremote.agent.plist"))
+}
+
+fn run_launchctl(arguments: &[&str]) -> Option<String> {
+    let output = Command::new("/bin/launchctl")
+        .args(arguments)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn parse_background_item_disposition(output: &str, identifier: &str) -> (bool, Option<bool>) {
+    let Some(block) = output
+        .split("\n\n")
+        .find(|block| block.contains(&format!("Identifier: 8.{identifier}")))
+    else {
+        return (false, None);
+    };
+    let disposition = block
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Disposition:"));
+    let enabled = disposition.map(|value| !value.contains("disabled"));
+    (true, enabled)
+}
+
+pub fn inspect_uu_remote_login_item() -> Result<UuRemoteLoginStatus, String> {
+    let app_installed = Path::new(UU_REMOTE_APP_PATH).is_dir();
+    let bundled_agent_available = Path::new(UU_REMOTE_AGENT_SOURCE).is_file();
+    let login_item_path = uu_remote_login_item_path()?;
+    let login_item_installed = login_item_path.is_file();
+    let uid = unsafe { getuid() };
+    let domain = format!("gui/{uid}");
+    let service = format!("gui/{uid}/{UU_REMOTE_LOGIN_LABEL}");
+    let launchd_output = run_launchctl(&["print", &service]);
+    let launchd_loaded = launchd_output.is_some();
+    let agent_running = launchd_output
+        .as_deref()
+        .is_some_and(|output| output.contains("state = running") && output.contains("pid ="));
+    let disabled_output = run_launchctl(&["print-disabled", &domain]).unwrap_or_default();
+    let launchd_enabled = !disabled_output
+        .lines()
+        .any(|line| line.contains(UU_REMOTE_LOGIN_LABEL) && line.contains("=> disabled"));
+    let btm_output = Command::new("/usr/bin/sfltool")
+        .arg("dumpbtm")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default();
+    let (background_item_registered, background_item_enabled) =
+        parse_background_item_disposition(&btm_output, UU_REMOTE_LOGIN_LABEL);
+    Ok(UuRemoteLoginStatus {
+        app_installed,
+        bundled_agent_available,
+        login_item_installed,
+        launchd_loaded,
+        launchd_enabled,
+        agent_running,
+        background_item_registered,
+        background_item_enabled,
+    })
+}
+
+pub fn ensure_uu_remote_login_item() -> Result<UuRemoteLoginStatus, String> {
+    if !Path::new(UU_REMOTE_APP_PATH).is_dir() {
+        return Err(format!("未找到 {UU_REMOTE_APP_PATH}，请先安装 UU远程。"));
+    }
+    if !Path::new(UU_REMOTE_AGENT_SOURCE).is_file() {
+        return Err("当前 UU远程安装包缺少后台登录代理配置。".to_string());
+    }
+
+    let destination = uu_remote_login_item_path()?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "无法确定登录项目录".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| format!("无法创建登录项目录：{error}"))?;
+
+    let source_changed = fs::read(UU_REMOTE_AGENT_SOURCE)
+        .map(|source| fs::read(&destination).map_or(true, |current| current != source))
+        .unwrap_or(true);
+    if source_changed {
+        let temporary = parent.join(".com.netease.uuremote.agent.plist.tmp");
+        fs::copy(UU_REMOTE_AGENT_SOURCE, &temporary)
+            .map_err(|error| format!("无法复制 UU远程后台登录项：{error}"))?;
+        fs::rename(&temporary, &destination)
+            .map_err(|error| format!("无法安装 UU远程后台登录项：{error}"))?;
+    }
+
+    let uid = unsafe { getuid() };
+    let domain = format!("gui/{uid}");
+    let service = format!("gui/{uid}/{UU_REMOTE_LOGIN_LABEL}");
+    if source_changed && run_launchctl(&["print", &service]).is_some() {
+        let _ = run_launchctl(&["bootout", &service]);
+    }
+    if run_launchctl(&["print", &service]).is_none() {
+        let path = destination.to_string_lossy();
+        let bootstrap = Command::new("/bin/launchctl")
+            .args(["bootstrap", &domain, path.as_ref()])
+            .output()
+            .map_err(|error| format!("无法注册 UU远程后台登录项：{error}"))?;
+        if !bootstrap.status.success() && run_launchctl(&["print", &service]).is_none() {
+            return Err(format!(
+                "macOS 拒绝注册 UU远程后台登录项：{}",
+                String::from_utf8_lossy(&bootstrap.stderr).trim()
+            ));
+        }
+    }
+    let _ = run_launchctl(&["enable", &service]);
+    let kickstart = Command::new("/bin/launchctl")
+        .args(["kickstart", "-k", &service])
+        .output()
+        .map_err(|error| format!("无法启动 UU远程后台服务：{error}"))?;
+    if !kickstart.status.success() {
+        return Err(format!(
+            "UU远程后台服务启动失败：{}",
+            String::from_utf8_lossy(&kickstart.stderr).trim()
+        ));
+    }
+    thread::sleep(Duration::from_millis(250));
+    inspect_uu_remote_login_item()
+}
+
+pub fn open_login_items_settings() -> Result<(), String> {
+    let output = Command::new("/usr/bin/open")
+        .arg("x-apple.systempreferences:com.apple.LoginItems-Settings.extension")
+        .output()
+        .map_err(|error| format!("无法打开登录项设置：{error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "无法打开登录项设置：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
 pub fn config_path() -> Result<PathBuf, String> {
     let home = env::var_os("HOME").ok_or_else(|| "无法确定用户目录".to_string())?;
     Ok(PathBuf::from(home)
@@ -627,5 +801,44 @@ mod tests {
         assert_eq!(process.pid, 11744);
         assert_eq!(process.name, "Microsoft AutoUpdate");
         assert!(process.executable_path.contains("Application Support"));
+    }
+
+    #[test]
+    fn parses_enabled_uuremote_background_item() {
+        let output = r#"Items:
+
+ #30:
+                 UUID: DD3BE709-46E6-4CAE-AE9C-0F5D9FF05212
+                 Name: UU远程
+                Type: legacy agent (0x10008)
+          Disposition: [enabled, allowed, not notified] (0x3)
+           Identifier: 8.com.netease.uuremote.agent
+                  URL: /Users/501/Library/LaunchAgents/com.netease.uuremote.agent.plist
+
+ #31:
+                 Name: Other
+           Identifier: 2.example.other"#;
+        assert_eq!(
+            parse_background_item_disposition(output, UU_REMOTE_LOGIN_LABEL),
+            (true, Some(true))
+        );
+    }
+
+    #[test]
+    fn detects_disabled_and_missing_uuremote_background_items() {
+        let disabled = r#"Items:
+
+ #30:
+                 Name: UU远程
+          Disposition: [disabled, allowed, notified] (0xa)
+           Identifier: 8.com.netease.uuremote.agent"#;
+        assert_eq!(
+            parse_background_item_disposition(disabled, UU_REMOTE_LOGIN_LABEL),
+            (true, Some(false))
+        );
+        assert_eq!(
+            parse_background_item_disposition("Items:\n", UU_REMOTE_LOGIN_LABEL),
+            (false, None)
+        );
     }
 }

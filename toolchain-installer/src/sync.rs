@@ -91,12 +91,27 @@ pub struct SyncOptions {
 pub struct SyncConfig {
     #[serde(default = "default_ignore_patterns")]
     pub ignore_patterns: Vec<String>,
+    #[serde(default)]
+    pub devices: Vec<SyncDeviceConfig>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SyncDeviceConfig {
+    pub enabled: bool,
+    pub host: String,
+    pub user: String,
+    pub port: String,
+    pub remote_path: String,
+    pub local_path: String,
+    pub jobs: String,
+    pub delete_missing: bool,
 }
 
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
             ignore_patterns: default_ignore_patterns(),
+            devices: Vec::new(),
         }
     }
 }
@@ -557,32 +572,20 @@ fn run_sync_inner(
             started,
             small_file_mode,
         )?;
-        (results, "openrsync 增量", lanes)
+        (results, "多路 rsync 增量", lanes)
     } else if interrupted_copy {
         send_status(
             tx,
-            "检测到上次未完成的传输。正在通过 openrsync 校验并补齐已有内容…",
+            "检测到上次首次传输尚未完成。正在继续 tar 流镜像；已有文件会保留，进度会立即更新…",
         );
-        let batches = plan_work_batches(&inventory.entries, options.jobs, small_file_mode);
-        let chunk_count = batches.len();
-        let lanes = options.jobs.clamp(1, 8).min(chunk_count);
-        let results = run_batches(
-            options,
-            &local_root,
-            &inventory,
-            batches,
-            cancel,
-            tx,
-            started,
-            small_file_mode,
-        )?;
+        let results = run_stream_archive(options, &local_root, &inventory, cancel, tx, started)?;
         mark_completed_copy(options, &local_root)?;
         clear_partial_copy(options, &local_root)?;
-        (results, "openrsync 断点补齐", lanes)
+        (results, "tar 流断点续传", 1)
     } else {
         send_status(
             tx,
-            "索引完成。首次同步启用单路 tar 流镜像；实测比 4 路 openrsync 快，并会立即显示字节进度。",
+            "索引完成。首次同步启用单路 tar 流镜像；实测比 4 路系统 rsync 快，并会立即显示字节进度。",
         );
         mark_partial_copy(options, &local_root)?;
         let results = run_stream_archive(options, &local_root, &inventory, cancel, tx, started)?;
@@ -1169,6 +1172,58 @@ fn rsync_command(options: &SyncOptions, source_root: &str, local_root: &Path) ->
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command
+}
+
+pub fn rsync_command_preview(options: &SyncOptions) -> Result<String, String> {
+    validate_options(options)?;
+    let local_root = expand_local_path(&options.local_path)?;
+    let source = remote_source(options, &options.remote_path);
+    let destination = ensure_trailing_slash(&local_root);
+    let mut parts = vec![
+        "/usr/bin/rsync".to_string(),
+        "-aE".to_string(),
+        "--no-r".to_string(),
+        "--partial".to_string(),
+        "--partial-dir=.mymac-partial".to_string(),
+        shell_quote("--rsync-path=/usr/bin/caffeinate -i /usr/bin/rsync"),
+        "--8-bit-output".to_string(),
+        "-e".to_string(),
+        shell_quote(&ssh_transport(options)),
+    ];
+    for pattern in &options.ignore_patterns {
+        parts.push("--exclude".to_string());
+        parts.push(shell_quote(pattern));
+    }
+    if options.delete_missing {
+        parts.push("--delete".to_string());
+    }
+    parts.push(shell_quote(&source));
+    parts.push(shell_quote(&destination.to_string_lossy()));
+    Ok(format!(
+        "# 应用并发：{} 路（下面为单路等效命令）\n{}",
+        options.jobs,
+        parts.join(" ")
+    ))
+}
+
+/// Reject overlapping targets before starting two device jobs at the same time.
+/// The expanded paths are compared after resolving their existing ancestors so
+/// `~`, symlinked Desktop folders, and equivalent absolute paths are caught too.
+pub fn validate_distinct_destinations(options: &[SyncOptions]) -> Result<(), String> {
+    let mut destinations = Vec::with_capacity(options.len());
+    for options in options {
+        validate_options(options)?;
+        let expanded = expand_local_path(&options.local_path)?;
+        let normalized = normalize_existing_ancestor(&expanded);
+        if destinations.iter().any(|existing| existing == &normalized) {
+            return Err(format!(
+                "两台设备不能写入同一个本地文件夹：{}",
+                expanded.display()
+            ));
+        }
+        destinations.push(normalized);
+    }
+    Ok(())
 }
 
 fn run_delete_pass(
@@ -1822,6 +1877,51 @@ fn format_duration(duration: Duration) -> String {
 mod tests {
     use super::*;
 
+    fn test_sync_options(local_path: &str) -> SyncOptions {
+        SyncOptions {
+            host: "192.168.32.8".to_string(),
+            user: "tester".to_string(),
+            port: 2202,
+            remote_path: "/Users/tester/Desktop".to_string(),
+            local_path: local_path.to_string(),
+            jobs: 4,
+            delete_missing: true,
+            ignore_patterns: vec![".DS_Store".to_string(), "Project Files".to_string()],
+        }
+    }
+
+    #[test]
+    fn legacy_sync_config_without_devices_still_loads() {
+        let config: SyncConfig = serde_json::from_str(r#"{"ignore_patterns":[".DS_Store"]}"#)
+            .expect("legacy sync config should deserialize");
+        assert_eq!(config.ignore_patterns, vec![".DS_Store"]);
+        assert!(config.devices.is_empty());
+    }
+
+    #[test]
+    fn rsync_preview_reflects_options_and_shell_quotes_paths() {
+        let command = rsync_command_preview(&test_sync_options("/tmp/Mac Sync/设备 2")).unwrap();
+        assert!(command.starts_with("# 应用并发：4 路"));
+        assert!(command.contains("\n/usr/bin/rsync "));
+        assert!(command.contains("-p 2202"));
+        assert!(command.contains("--exclude '.DS_Store'"));
+        assert!(command.contains("--exclude 'Project Files'"));
+        assert!(command.contains("--delete"));
+        assert!(command.contains("'tester@192.168.32.8:/Users/tester/Desktop/'"));
+        assert!(command.contains("'/tmp/Mac Sync/设备 2/'"));
+    }
+
+    #[test]
+    fn simultaneous_sync_rejects_the_same_local_destination() {
+        let first = test_sync_options("/tmp/my-mac-device-one");
+        let mut second = test_sync_options("/tmp/my-mac-device-two");
+        assert!(validate_distinct_destinations(&[first.clone(), second.clone()]).is_ok());
+
+        second.local_path = first.local_path.clone();
+        let error = validate_distinct_destinations(&[first, second]).unwrap_err();
+        assert!(error.contains("同一个本地文件夹"));
+    }
+
     #[test]
     fn inventory_parser_keeps_spaces_and_chinese() {
         let entry = parse_inventory_entry("Regular File|123|/资料/项目 文件.txt").unwrap();
@@ -2008,7 +2108,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_openrsync_output() {
+    fn parses_rsync_output() {
         assert_eq!(parse_xfer_size("XFER|4096|a.txt"), Some(4096));
         assert_eq!(
             parse_xfer_path("XFER|4096|目录/文件.txt"),

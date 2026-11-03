@@ -1922,6 +1922,7 @@ dependencies = [
  "nsh-base",
  "nsh-core",
  "nsh-platform-macos",
+ "objc2-app-kit",
  "serde",
  "serde_json",
 ]
